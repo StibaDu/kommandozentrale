@@ -1,0 +1,31 @@
+{
+  "name": "kommandozentrale",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run build:client && bun --watch src/server.ts",
+    "start": "bun run build:client && bun src/server.ts",
+    "build:client": "bun scripts/build-client.ts",
+    "ingest": "bun src/ingest.ts",
+    "seed:demo": "bun scripts/seed-demo.ts",
+    "smoke": "bun scripts/smoke.ts",
+    "eval": "bun scripts/eval.ts",
+    "start:lan": "HOST=0.0.0.0 bun run start",
+    "dev:lan": "HOST=0.0.0.0 bun run dev"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "marked": "^15.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

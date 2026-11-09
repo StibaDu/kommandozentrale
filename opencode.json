@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "cloudflare": { "disabled": true },
+      "cloudflare-docs": { "disabled": true },
+      "cloudflare-bindings": { "disabled": true },
+      "cloudflare-builds": { "disabled": true },
+      "cloudflare-observability": { "disabled": true },
+      "rea": { "disabled": true }
+    }
+  }
+}
