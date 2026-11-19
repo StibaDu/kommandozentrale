@@ -149,6 +149,16 @@ Beim ersten Start dauert der Import etwa zehn Sekunden. Er legt `data/kommandoze
 
 Die App versteht darunter Karten, deren Oracle-Text ausdrücklich sagt, dass du das Spiel gewinnst (`you win the game`). Sie sind dauerhaft ausgeschlossen: nicht im Kandidatenpool, nicht im Import, nicht per manueller Ergänzung und nicht als Commander. Es gibt keinen Schalter. Andere Combos sind damit nicht automatisch verboten; dafür gibt es den Combo-Schalter und das Bracket-Budget.
 
+## Windows-Release
+
+Voraussetzungen zum Bauen: Bun, Python 3 und Inno Setup 6 (ISCC.exe). Der Build packt die Bun-Runtime, die Produktionsabhängigkeiten, den gebauten Client und eine bereinigte Karten-Datenbank in ein Setup:
+
+```powershell
+.\scripts\build-release.ps1 -Version 0.1.0
+```
+
+Die Release-Datenbank enthält keine Profile, Decks, Chatverläufe, Sessions oder NSFW-Arts aus der Entwicklung. Das Setup installiert pro Benutzer nach `%LOCALAPPDATA%\Kommandozentrale`; die Datenbank bleibt bei einer Deinstallation erhalten. Die KI-Funktionen benötigen weiterhin `opencode` und Ollama mit `bge-m3`; ohne sie läuft die Engine.
+
 ## Architektur
 
 ```

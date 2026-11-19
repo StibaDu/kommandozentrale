@@ -6,6 +6,7 @@ pnpm-lock.yaml
 graphify-out/
 .tokensave/
 exports/
+build/
 
 # Build output
 public/main.js
