@@ -236,6 +236,8 @@ export interface Candidate {
   tags: string[]
   /** Automatischer Effekt-Suchtreffer aus der Deck-Vision. */
   vision?: VisionMatch
+  /** Karte aus der mechanik-/themenbasierten Suche (z. B. Shadow). */
+  theme?: { label: string }
 }
 
 export function buildPool(commander: Card, settings: DeckSettings): Candidate[] {
@@ -271,7 +273,7 @@ export function buildPool(commander: Card, settings: DeckSettings): Candidate[] 
   return [...map.values()]
 }
 
-function bracketQuotas(bracket: BracketId) {
+export function bracketQuotas(bracket: BracketId) {
   const b = BRACKETS.find((x) => x.id === bracket) ?? BRACKETS[0]
   return b.quotas as Record<string, number>
 }
@@ -302,6 +304,9 @@ export function makeDeckCard(card: Card, role: Role, reason: string, tags: strin
     printing_id: null,
     art_url: null,
     artist: null,
+    back_printing_id: null,
+    back_art_url: null,
+    back_artist: null,
     quantity: 1,
     is_commander: false,
     tags,

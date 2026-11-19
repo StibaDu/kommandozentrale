@@ -26,6 +26,22 @@ export interface Meta {
   network: NetworkInfo
 }
 
+export interface DeckIdeaKeyCard {
+  name: string
+  role: string
+  why: string
+}
+
+export interface DeckIdea {
+  title: string
+  themes: string[]
+  strategy: string
+  keyCards: DeckIdeaKeyCard[]
+  synergies: string[]
+  wincons: string[]
+  risks: string
+}
+
 export interface CommanderSuggestion {
   oracle_id: string
   name: string
@@ -35,6 +51,7 @@ export interface CommanderSuggestion {
   image_uris: Record<string, string> | null
   edhrec_rank: number | null
   reason: string
+  idea?: DeckIdea
 }
 
 export interface CommanderSuggestionResponse {
@@ -86,6 +103,88 @@ export interface DeckSummary {
   visibility: string
 }
 
+export interface SimulationSwap {
+  cut: string
+  add: string
+  reason: string
+  fixes: string[]
+}
+
+export interface DeckSimulation {
+  createdAt: string
+  deckUpdatedAt?: string
+  score: number
+  runs: number
+  theme: { label: string; count: number; target: number; coverage: number } | null
+  metrics: {
+    themeLabel: string | null
+    themeCount: number
+    themeTarget: number
+    themeCoverage: number
+    lands: number
+    ramp: number
+    draw: number
+    removal: number
+    wipes: number
+    protection: number
+    tutors: number
+    recursion: number
+    wincons: number
+    interaction: number
+    averageMv: number
+    missedLandDropRate: number
+    colorScrewRate: number
+    averageCommanderTurn: number | null
+    averageLandsByTurn4: number
+  }
+  opening: {
+    hands: number
+    keepablePct: number
+    averageLands: number
+    themeInHandPct: number
+    noPlayPct: number
+  }
+  scenarios: Array<{ name: string; risk: "hoch" | "mittel" | "niedrig"; text: string }>
+  deadCards: Array<{ name: string; role: string; cmc: number; reason: string }>
+  weaknesses: Array<{ id: string; severity: "high" | "medium" | "low"; title: string; text: string; fixes: string[] }>
+  strengths: string[]
+  improvement?: {
+    beforeScore: number
+    afterScore: number
+    applied: SimulationSwap[]
+    rejected: Array<{ swap: SimulationSwap; reason: string }>
+    assessment: string
+  } | null
+}
+
+export interface DeckChatProposal {
+  id: string
+  cut_name: string
+  add_name: string
+  reason: string
+  fixes: string[]
+  status: "open" | "applied" | "rejected"
+  created_at: string
+  applied_at?: string | null
+}
+
+export interface DeckChatEntry {
+  id: string
+  role: "user" | "assistant"
+  content: string
+  model?: string | null
+  created_at: string
+  proposals?: DeckChatProposal[]
+}
+
+export interface DeckChatApplyResult {
+  deck: Deck
+  applied: Array<{ id?: string; cut: string; add: string; reason: string; fixes: string[] }>
+  rejected: Array<{ swap: { id?: string; cut: string; add: string; reason: string; fixes: string[] }; reason: string }>
+  revisionId?: string | null
+  error?: string
+}
+
 export interface Deck {
   id: string
   name: string
@@ -102,7 +201,7 @@ export interface Deck {
     colors: string[]
     color_identity: string[]
     image_uris: Record<string, string> | null
-    card_faces?: Array<{ image_uris?: Record<string, string> | null }> | null
+    card_faces?: Array<{ name?: string; image_uris?: Record<string, string> | null }> | null
     power: string | null
     toughness: string | null
     edhrec_rank: number | null
@@ -113,6 +212,9 @@ export interface Deck {
     printing_id: string | null
     art_url: string | null
     artist: string | null
+    back_printing_id: string | null
+    back_art_url: string | null
+    back_artist: string | null
   }
   bracket: 3 | 4 | 5
   pod_size: number
@@ -137,7 +239,7 @@ export interface Deck {
     colors: string[]
     color_identity: string[]
     image_uris: Record<string, string> | null
-    card_faces?: Array<{ image_uris?: Record<string, string> | null }> | null
+    card_faces?: Array<{ name?: string; image_uris?: Record<string, string> | null }> | null
     edhrec_rank: number | null
     legalities: Record<string, string>
     is_game_changer: boolean
@@ -150,6 +252,9 @@ export interface Deck {
     printing_id: string | null
     art_url: string | null
     artist: string | null
+    back_printing_id: string | null
+    back_art_url: string | null
+    back_artist: string | null
     quantity: number
     tags: string[]
     board?: "main" | "maybeboard"
@@ -179,6 +284,13 @@ export interface Deck {
       colorScrewRate: number
     }
   } | null
+  simulation: DeckSimulation | null
+}
+
+export interface CommanderDeckPreview {
+  cards: Deck["cards"]
+  analysis: Deck["analysis"]
+  theme: { label: string; count: number; target: number } | null
 }
 
 export interface BuildRun {
@@ -223,6 +335,15 @@ export interface BabyzillaInfo {
     cacheReadTokens: number
     costUsd: number
   }
+}
+
+export interface EmbeddingStatus {
+  model: string
+  ready: boolean
+  count: number
+  total: number
+  dim: number | null
+  updatedAt: string | null
 }
 
 export interface GameRecord {
@@ -309,6 +430,7 @@ export interface GermanCardFace {
 export interface GermanCardText {
   name: string
   oracle_text: string | null
+  type_line: string | null
   card_faces: GermanCardFace[] | null
   set_code: string | null
   set_name: string | null
@@ -485,6 +607,9 @@ export interface ArtOption {
   name: string
   imageUrl: string
   thumbnailUrl: string
+  backImageUrl?: string | null
+  backThumbnailUrl?: string | null
+  backArtist?: string | null
   artist?: string
   setCode?: string
   setName?: string
@@ -580,11 +705,31 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  previewCommanderDeck: (body: { commanderName: string; brief: string; bracket: 3 | 4 | 5; podSize: number; settings: Record<string, unknown> }) =>
+    req<CommanderDeckPreview>("/api/commanders/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   babyzilla: () => req<BabyzillaInfo>("/api/babyzilla"),
+  embeddings: () => req<EmbeddingStatus>("/api/embeddings"),
   decks: () => req<DeckSummary[]>("/api/decks"),
   deck: (id: string) => req<Deck>(`/api/decks/${id}`),
+  deckChat: (id: string) => req<{ messages: DeckChatEntry[] }>(`/api/decks/${id}/chat`),
+  sendDeckChat: (id: string, message: string) =>
+    req<{ user: DeckChatEntry; reply: DeckChatEntry }>(`/api/decks/${id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    }),
+  applyDeckChat: (id: string, proposalIds: string[]) =>
+    req<DeckChatApplyResult>(`/api/decks/${id}/chat/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ proposalIds }),
+    }),
   deckCombos: (id: string, refresh = false) => req<DeckComboResult>(`/api/decks/${id}/combos${refresh ? "?refresh=1" : ""}`),
-  search: (q: string, opts: { mode?: "auto" | "name" | "effect"; color?: string[]; legal?: boolean; limit?: number } = {}) => {
+  search: (q: string, opts: { mode?: "auto" | "name" | "effect" | "semantic"; color?: string[]; legal?: boolean; limit?: number } = {}) => {
     const params = new URLSearchParams()
     params.set("q", q)
     params.set("limit", String(opts.limit ?? 18))
@@ -630,6 +775,7 @@ export const api = {
   buildStatus: (runId: string) => req<BuildRun>(`/api/builds/${runId}`),
   cancelBuild: (runId: string) =>
     req<{ ok: boolean; status: string }>(`/api/builds/${runId}/cancel`, { method: "POST" }),
+  simulateDeck: (id: string) => req<Deck>(`/api/decks/${id}/simulate`, { method: "POST" }),
   games: () => req<GameRecord[]>("/api/games"),
   createGame: (body: {
     playedAt?: string
@@ -660,7 +806,8 @@ export const api = {
       body: JSON.stringify(body),
     }),
   printings: (oracleId: string) => req<{ printings: ArtOption[]; error?: string }>(`/api/cards/${oracleId}/printings`),
-  mpcfill: (oracleId: string) => req<{ arts: ArtOption[]; error?: string }>(`/api/cards/${oracleId}/mpcfill`),
+  mpcfill: (oracleId: string, face?: "front" | "back") =>
+    req<{ arts: ArtOption[]; error?: string }>(`/api/cards/${oracleId}/mpcfill${face === "back" ? "?face=back" : ""}`),
   card: (oracleId: string) => req<{ card: any; tags: string[]; rulings: any[] }>(`/api/cards/${oracleId}`),
   germanCard: (oracleId: string) => req<{ german: GermanCardText | null; error?: string }>(`/api/cards/${oracleId}/german`),
   translateCombos: (items: ComboTextInput[]) =>
@@ -784,7 +931,19 @@ export const api = {
       body: JSON.stringify({ addName, removeOracleId }),
     }),
   removeCard: (deckId: string, oracleId: string) => req<Deck>(`/api/decks/${deckId}/cards/${oracleId}`, { method: "DELETE" }),
-  setArt: (deckId: string, oracleId: string, body: { printingId?: string | null; artUrl?: string | null; artist?: string | null }) =>
+  setArt: (
+    deckId: string,
+    oracleId: string,
+    body: {
+      face?: "front" | "back"
+      printingId?: string | null
+      artUrl?: string | null
+      artist?: string | null
+      backPrintingId?: string | null
+      backArtUrl?: string | null
+      backArtist?: string | null
+    },
+  ) =>
     req<{ ok: boolean }>(`/api/decks/${deckId}/cards/${oracleId}/art`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

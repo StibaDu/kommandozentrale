@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react"
 import { api } from "./api"
 
 export function cx(...parts: Array<string | false | null | undefined>) {
@@ -296,7 +296,12 @@ export function PodPicker({ value, onChange }: { value: number; onChange: (next:
   )
 }
 
-const SEARCH_MODE_LABELS: Record<"auto" | "name" | "effect", string> = { auto: "Auto", name: "Name", effect: "Effekt" }
+const SEARCH_MODE_LABELS: Record<"auto" | "name" | "effect" | "semantic", string> = {
+  auto: "Auto",
+  name: "Name",
+  effect: "Effekt",
+  semantic: "Semantik",
+}
 
 const TAG_LABELS: Record<string, string> = {
   sweeper: "Boardwipe",
@@ -355,11 +360,11 @@ export function SearchBox({
   onPick: (name: string) => void
   placeholder: string
   autoFocus?: boolean
-  mode?: "auto" | "name" | "effect"
+  mode?: "auto" | "name" | "effect" | "semantic"
   context?: { colorIdentity?: string[]; commanderLegal?: boolean }
 }) {
   const [q, setQ] = useState("")
-  const [mode, setMode] = useState<"auto" | "name" | "effect">(initialMode)
+  const [mode, setMode] = useState<"auto" | "name" | "effect" | "semantic">(initialMode)
   const [results, setResults] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [interpreting, setInterpreting] = useState(false)
@@ -408,7 +413,7 @@ export function SearchBox({
           autoFocus={autoFocus}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && mode !== "name") {
+            if (e.key === "Enter" && mode !== "name" && mode !== "semantic") {
               e.preventDefault()
               void interpret()
             }
@@ -420,7 +425,7 @@ export function SearchBox({
         {interpreting && <span className="search-loading">versteht…</span>}
       </div>
       <div className="search-modes">
-        {(["auto", "name", "effect"] as const).map((option) => (
+        {(["auto", "name", "effect", "semantic"] as const).map((option) => (
           <button
             key={option}
             type="button"
@@ -431,7 +436,13 @@ export function SearchBox({
             {SEARCH_MODE_LABELS[option]}
           </button>
         ))}
-        <span className="search-hint">{mode === "name" ? "nur Namen" : "Enter für ganze Sätze"}</span>
+        <span className="search-hint">
+          {mode === "name"
+            ? "nur Namen"
+            : mode === "semantic"
+              ? "nach Bedeutung & Mechanik"
+              : "Enter für ganze Sätze"}
+        </span>
       </div>
       {interpreted.length > 0 && <p className="search-interpreted">verstanden als: {interpreted.join(" · ")}</p>}
       <div className="search-results">
@@ -477,22 +488,30 @@ function escapeHtml(text: string) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 }
 
-function inline(text: string) {
+function inline(text: string, cardLinks = false) {
   return escapeHtml(text)
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`(.+?)`/g, "<code>$1</code>")
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/`(.+?)`/g, cardLinks ? '<code class="card-link" data-card-name="$1" title="Karte ansehen">$1</code>' : "<code>$1</code>")
 }
 
-export function Markdown({ text }: { text: string }) {
-  const lines = text.split("\n")
-  const blocks: ReactNode[] = []
-  let list: string[] = []
-  const flush = () => {
+export function Markdown({ text, onCardName }: { text: string; onCardName?: (name: string) => void }) {
+    const lines = text.split("\n")
+    const blocks: ReactNode[] = []
+    let list: string[] = []
+    const onContentClick = (event: MouseEvent<HTMLDivElement>) => {
+      if (!onCardName) return
+      const target = (event.target as HTMLElement).closest("[data-card-name]") as HTMLElement | null
+      if (!target) return
+      event.preventDefault()
+      const name = target.getAttribute("data-card-name")
+      if (name) onCardName(name)
+    }
+    const flush = () => {
     if (!list.length) return
     blocks.push(
       <ul key={`ul-${blocks.length}`}>
         {list.map((item, i) => (
-          <li key={i} dangerouslySetInnerHTML={{ __html: inline(item) }} />
+          <li key={i} dangerouslySetInnerHTML={{ __html: inline(item, Boolean(onCardName)) }} />
         ))}
       </ul>,
     )
@@ -517,12 +536,12 @@ export function Markdown({ text }: { text: string }) {
       list.push(trimmed.slice(2))
     } else {
       flush()
-      blocks.push(<p key={blocks.length} dangerouslySetInnerHTML={{ __html: inline(trimmed) }} />)
+        blocks.push(<p key={blocks.length} dangerouslySetInnerHTML={{ __html: inline(trimmed, Boolean(onCardName)) }} />)
     }
   }
-  flush()
-  return <div className="markdown">{blocks}</div>
-}
+    flush()
+    return <div className="markdown" onClick={onContentClick}>{blocks}</div>
+  }
 
 export function Modal({ title, onClose, children, wide = false }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
   useEffect(() => {

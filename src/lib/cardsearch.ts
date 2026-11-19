@@ -1,5 +1,6 @@
 import { db } from "../db"
-import { parseCard } from "./engine"
+import { parseCard, tagsFor } from "./engine"
+import { embedTexts, embeddingStatus, loadVectorIndex, normalizeVector } from "./embeddings"
 import type { Card } from "./types"
 
 /**
@@ -14,7 +15,7 @@ import type { Card } from "./types"
  * bm25 bevorzugt sonst seltene Wörter und damit obskure Karten.
  */
 
-export type SearchMode = "auto" | "name" | "effect"
+export type SearchMode = "auto" | "name" | "effect" | "semantic"
 
 export interface SearchOptions {
   mode?: SearchMode
@@ -26,10 +27,12 @@ export interface SearchOptions {
   type?: string
   /** Nur legendäre Kreaturen, die als Commander legal sind (Vision-Suche). */
   legendaryCommander?: boolean
+  /** Basics aus dem semantischen Trefferbild nehmen (Deckbau). */
+  excludeBasicLands?: boolean
 }
 
 export interface SearchMatch {
-  kind: "name" | "text" | "tag"
+  kind: "name" | "text" | "tag" | "vector"
   tags: string[]
   snippet: string | null
 }
@@ -228,6 +231,9 @@ const WORDS: Record<string, string> = {
   extra: "extra",
   verdoppeln: "double",
   verdoppelt: "double",
+  rampen: "ramp",
+  beschleunigen: "ramp",
+  beschleunigt: "ramp",
   mill: "mill",
   millen: "mill",
   abwerfen: "discard",
@@ -247,8 +253,19 @@ const WORDS: Record<string, string> = {
 const TAG_HINTS: Record<string, string[]> = {
   wipe: ["sweeper", "multi-removal", "sweeper-one-sided"],
   boardwipe: ["sweeper", "multi-removal", "sweeper-one-sided"],
+  boardwipes: ["sweeper", "multi-removal", "sweeper-one-sided"],
   boardreset: ["sweeper", "multi-removal"],
+  wrath: ["sweeper", "multi-removal"],
+  wraths: ["sweeper", "multi-removal"],
+  massenentfernung: ["sweeper", "multi-removal"],
   sweeper: ["sweeper", "multi-removal", "sweeper-one-sided"],
+  schutz: ["protects-creature", "protects-all", "protects-permanent", "gives-hexproof", "gives-indestructible"],
+  schuetzen: ["protects-creature", "protects-all", "protects-permanent", "gives-hexproof", "gives-indestructible"],
+  beschuetzen: ["protects-creature", "protects-all", "protects-permanent", "gives-hexproof", "gives-indestructible"],
+  unzerstoerbar: ["gives-indestructible", "indestructible"],
+  fluchsicher: ["gives-hexproof", "hexproof"],
+  indestructible: ["gives-indestructible", "indestructible"],
+  hexproof: ["gives-hexproof", "hexproof"],
   removal: ["spot-removal", "removal-creature", "removal-destroy", "removal-exile", "removal-sacrifice"],
   spotremoval: ["spot-removal"],
   ramp: ["ramp", "land-ramp", "mana-rock", "mana-dork", "ritual"],
@@ -488,6 +505,9 @@ function filters(opts: SearchOptions): Filter {
   }
   if (opts.legendaryCommander) {
     clauses.push("card.is_legendary = 1 AND card.is_creature = 1")
+  }
+  if (opts.excludeBasicLands) {
+    clauses.push("card.name NOT IN ('Plains','Island','Swamp','Mountain','Forest','Wastes')")
   }
   return { sql: clauses.join(" AND "), params }
 }
@@ -732,4 +752,143 @@ export function searchStructured(spec: StructuredQuery, opts: SearchOptions = {}
     or: terms.length > 1 ? `oracle_text_all : (${terms.map((t) => `${t}*`).join(" OR ")})` : terms.length ? `oracle_text_all : (${terms[0]}*)` : null,
   }
   return runSearch(built, { ...opts, maxCmc: spec.maxCmc ?? opts.maxCmc, type: spec.type ?? opts.type }, false)
+}
+
+// ---------------------------------------------------------------------------
+// Semantische Suche über den Vektorindex
+// ---------------------------------------------------------------------------
+
+function semanticEligibleIds(opts: SearchOptions): Set<string> {
+  const filter = filters(opts)
+  const rows = db.query(`SELECT card.oracle_id FROM card WHERE ${filter.sql}`).all(...filter.params) as any[]
+  return new Set(rows.map((row) => String(row.oracle_id)))
+}
+
+interface RankedId {
+  id: string
+  score: number
+}
+
+function rankByVector(
+  index: { dim: number; ids: string[]; vectors: Float32Array },
+  query: Float32Array,
+  eligible: Set<string>,
+  limit: number,
+): RankedId[] {
+  const { dim, ids, vectors } = index
+  const ranked: RankedId[] = []
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i]
+    if (!eligible.has(id)) continue
+    const base = i * dim
+    let score = 0
+    for (let d = 0; d < dim; d++) score += vectors[base + d] * query[d]
+    ranked.push({ id, score })
+  }
+  ranked.sort((a, b) => b.score - a.score)
+  return ranked.slice(0, limit)
+}
+
+function semanticHits(ranked: RankedId[], opts: SearchOptions, query: string, limit: number): SearchHit[] {
+  if (!ranked.length) return []
+  const ids = ranked.map((row) => row.id)
+  const placeholders = ids.map(() => "?").join(",")
+  const rows = db.query(`SELECT * FROM card WHERE oracle_id IN (${placeholders})`).all(...ids) as any[]
+  const byId = new Map(rows.map((row) => [String(row.oracle_id), row]))
+  const tagMap = tagsFor(ids)
+  const built = buildQuery(query)
+  const hits: SearchHit[] = []
+  for (const entry of ranked.slice(0, limit)) {
+    const row = byId.get(entry.id)
+    if (!row) continue
+    const tags = (tagMap.get(entry.id) ?? []).filter(
+      (tag) => tag !== "activated-ability" && tag !== "triggered-ability",
+    )
+    const text = String(row.oracle_text_all ?? "")
+    const snippet =
+      (built.terms.length ? snippetFor(text, built.terms) : null) ??
+      (text ? `${text.replace(/\s+/g, " ").slice(0, 180).trim()}${text.length > 180 ? "…" : ""}` : null)
+    hits.push({
+      card: parseCard(row),
+      score: entry.score,
+      match: { kind: "vector", tags: tags.slice(0, 4), snippet },
+    })
+  }
+  return hits
+}
+
+const semanticCache = new Map<string, SearchHit[]>()
+const SEMANTIC_CACHE_MAX = 120
+
+function semanticCacheKey(query: string, opts: SearchOptions, limit: number, signature: string): string {
+  return JSON.stringify([
+    signature,
+    query.trim().toLowerCase(),
+    limit,
+    opts.colorIdentity ?? null,
+    Boolean(opts.commanderLegal),
+    opts.maxCmc ?? null,
+    opts.type ?? null,
+    Boolean(opts.legendaryCommander),
+    Boolean(opts.excludeBasicLands),
+  ])
+}
+
+/** Deutsche Strategie-Sprache → englische Mechanik-Begriffe. bge-m3 versteht
+ *  Deutsch, aber Begriffe wie "Boardwipes" oder "Schutz" treffen erst mit den
+ *  englischen Oracle-/Tag-Begriffen die richtigen Karten. */
+const PROTECTIVE_QUERY = /\b(schutz|schuetzen|beschuetzen|gegen|ueberleben|verhindern|verhindert|abschirmen)\b/i
+const THREAT_TAGS = new Set(["sweeper", "multi-removal", "sweeper-one-sided", "mass-land-denial", "extra-turn"])
+
+function semanticQueryText(query: string): string {
+  const profile = effectProfile(query)
+  const tags = PROTECTIVE_QUERY.test(normalizeDe(query))
+    ? profile.tags.filter((tag) => !THREAT_TAGS.has(tag))
+    : profile.tags
+  const hints = [...profile.terms, ...tags.map((tag) => tag.replace(/-/g, " "))]
+  const unique = [...new Set(hints.map((hint) => hint.trim()).filter(Boolean))].slice(0, 18)
+  return unique.length ? `${query}\n${unique.join(", ")}` : query
+}
+
+export async function semanticSearch(input: string, opts: SearchOptions = {}): Promise<SearchHit[]> {
+  const results = await semanticSearchMany([input], opts, Math.min(50, Math.max(1, opts.limit ?? 18)))
+  return results[0] ?? []
+}
+
+/** Mehrere Queries in einem Rutsch einbetten und getrennt suchen. Wird vom
+ *  Deck-Vision-Retriever genutzt, damit nicht jede Teilsuche einen eigenen
+ *  Ollama-Aufruf startet. */
+export async function semanticSearchMany(
+  queries: string[],
+  opts: SearchOptions = {},
+  perQuery = 10,
+): Promise<SearchHit[][]> {
+  const clean = queries.map((query) => query.trim()).filter(Boolean)
+  if (!clean.length) return []
+  const index = loadVectorIndex()
+  if (!index) throw new Error("Kein Vektorindex vorhanden. Zuerst `bun run embed` ausführen.")
+  const eligible = semanticEligibleIds(opts)
+  if (!eligible.size) return clean.map(() => [])
+
+  const status = embeddingStatus()
+  const signature = `${status.model}:${status.updatedAt ?? ""}:${status.count}`
+  const limit = Math.min(100, Math.max(1, perQuery))
+  const keys = clean.map((query) => semanticCacheKey(query, opts, limit, signature))
+  const missing = clean.map((query, i) => ({ query, i })).filter(({ i }) => !semanticCache.has(keys[i]))
+
+  if (missing.length) {
+    const vectors = await embedTexts(
+      missing.map(({ query }) => semanticQueryText(query)),
+      { batchSize: 8, concurrency: 8 },
+    )
+    vectors.forEach((vector) => normalizeVector(vector))
+    missing.forEach(({ query, i }, position) => {
+      const ranked = rankByVector(index, vectors[position], eligible, limit)
+      const hits = semanticHits(ranked, opts, query, limit)
+      if (semanticCache.size >= SEMANTIC_CACHE_MAX) semanticCache.clear()
+      semanticCache.set(keys[i], hits)
+    })
+  }
+
+  return clean.map((_, i) => semanticCache.get(keys[i]) ?? [])
 }

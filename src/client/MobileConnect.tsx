@@ -109,10 +109,17 @@ export function MobileConnectModal({ meta, onClose }: { meta: Meta; onClose: () 
           )}
 
           <div className="mobile-connect-notes">
-            <p>
-              <strong>WLAN-Wechsel:</strong> Nimm die Adresse mit <code>.local</code>, nicht die IP. Sie bleibt gleich,
-              auch wenn der Mac in einem anderen WLAN eine neue IP bekommt.
-            </p>
+            {network.mdnsUrl ? (
+              <p>
+                <strong>WLAN-Wechsel:</strong> Nimm die Adresse mit <code>.local</code>, nicht die IP. Sie bleibt gleich,
+                auch wenn der Rechner in einem anderen WLAN eine neue IP bekommt.
+              </p>
+            ) : (
+              <p>
+                <strong>WLAN:</strong> Nutze die aktuelle LAN-IP-Adresse. Unter Windows ist sie nicht automatisch stabil;
+                nach einem WLAN-Wechsel kann sich die IP ändern.
+              </p>
+            )}
             {network.publicUrl ? (
               <p><strong>Öffentlich:</strong> Diese Instanz läuft über eine feste öffentliche Adresse und funktioniert auch außerhalb des WLANs.</p>
             ) : network.tailscaleUrl ? (
@@ -121,8 +128,9 @@ export function MobileConnectModal({ meta, onClose }: { meta: Meta; onClose: () 
               <p><strong>Tailscale:</strong> installiert, aber nicht verbunden. Starte Tailscale, wenn Mac und Handy nicht im selben WLAN sind.</p>
             ) : null}
             <p className="field-note">
-              Falls die .local-Adresse auf einem Android-Gerät nicht aufgelöst wird, nimm die aktuelle IP als Fallback.
-              Die macOS-Firewall muss eingehende Verbindungen für Bun erlauben.
+              {network.mdnsUrl
+                ? "Falls die .local-Adresse auf einem Android-Gerät nicht aufgelöst wird, nimm die aktuelle IP als Fallback."
+                : "Die Firewall von Windows muss eingehende Verbindungen für Bun erlauben."}
             </p>
           </div>
         </div>

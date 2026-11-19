@@ -10,8 +10,18 @@ Die App ist eigenständig. Sie fasst `mtg-proxy-lab` nicht an und hängt nicht d
 cd ~/kommandozentrale
 bun install
 bun run ingest       # Scryfall-Karten, Tags, Rulings, CR und Hausregeln
+bun run embed        # Vektorindex über alle Karten (Ollama + bge-m3)
 bun run start        # http://localhost:4173
 ```
+
+Der Vektorindex braucht einmalig Ollama mit `bge-m3`:
+
+```bash
+ollama pull bge-m3
+bun run embed        # ca. 15–30 Minuten für 39.288 Karten
+```
+
+Danach genügt `bun run embed`, um nach einem neuen `ingest` nur geänderte Karten nachzuziehen. `bun run embed:status` zeigt den Stand.
 
 Beim ersten Öffnen legst du dein Admin-Profil nur mit Anzeigenamen an. Danach werden automatisch Einladungen für **Dennis, Ingo, Bamdad und Nima** erzeugt. Die Codes und QR-Codes findest du unter **Profil → Einladungen**.
 
@@ -61,6 +71,10 @@ Beim ersten Start dauert der Import etwa zehn Sekunden. Er legt `data/kommandoze
 - **Deck-Vision:** Vor dem ersten Build und später im Builder beschreibst du Mechaniken, Tempo, Wincons und No-Gos in bis zu 2.000 Zeichen. Die Vision wird pro Deck gespeichert, beim Bauen an den Agenten übergeben und im Primer erklärt. Der Engine-Fallback baut ohne Vision weiter.
 - 0 Rule als Master-Schalter, dazu einzelne Schalter für illegale Karten, Banlist, Un-Cards, Game-Changer-Limit, Tutoren, Extra-Züge, Mass Land Denial, Combos und Salz-Budget. Farbidentität und 1-Win-Karten sind dauerhaft Pflicht bzw. ausgeschlossen und haben keinen Schalter.
 - DeepSeek V4.1 Flash baut aus einem lokalen Kandidatenpool. Die Engine repariert und prüft danach: 100 Karten, Singleton, Rollen, Kurve, Farbquellen, Bracket-Budget.
+- **Strategischer Kandidatenpool:** Rollen und Scryfall-Tags liefern die Grundabdeckung; die Deck-Vision wird zusätzlich lexikalisch (Glossar + Tags) und semantisch (Vektorindex) durchsucht. Der Commander-Text ist immer eine eigene Vektor-Query, damit auch ohne ausformulierte Vision Karten mit derselben Mechanik im Pool landen.
+- **Deck-Ideen aus der Vision:** Die Vision-Ansicht schlägt bis zu drei komplette Ideen vor: Commander, Theme, Schlüsselkarten, Synergie-Cluster, Wincons und Risiken. „Diese Deck-Idee bauen“ startet den Build mit dieser Vision.
+- **Mechanik-Quote:** Der Builder erkennt Mechaniken wie Shadow, Landfall oder Sacrifice über Keywords, Scryfall-Tags und Oracle-Text. Nach dem KI-/Engine-Build ersetzt die Engine generische Flex-Karten durch die besten Theme-Karten (Shadow-Beispiel: 42 von 99). Bracket 4 ist die Obergrenze, kein Ziel.
+- **Windows-Prompt:** Der Agent-Prompt geht über stdin an `opencode run`; das umgeht das 32k-Kommandozeilenlimit und verhindert den bisherigen stillen Engine-Fallback.
 - Wenn der Agent ausfällt, baut die deterministische Engine weiter. Das Deck ist dann weniger elegant, aber spielbar.
 - **Import:** Moxfield-, Archidekt- oder einfache Textlisten. Der Parser erkennt Commander-Abschnitt, `1x`-Schreibweisen, Set-Kürzel, Foil-Marker und Sideboard/Maybeboard. Unbekannte Namen und nach den Hausregeln übersprungene Karten werden im Ergebnisbericht gezeigt. Auch ein Import bleibt zunächst ein Entwurf, bis du ihn mit Profil speicherst.
 - **Spielprotokoll:** Datum, Pod-Größe, Siegerdeck, Züge, Fun, Salz und Notizen. Beendete Tische speichern zusätzlich alle Teilnehmer, Decks und Endstände. Bei nachgetragenen Runden wird der Sieger als Teilnehmer erfasst, damit die persönliche Statistik stimmt; alte Einträge werden beim Start nachgezogen.
@@ -70,6 +84,7 @@ Beim ersten Start dauert der Import etwa zehn Sekunden. Er legt `data/kommandoze
 ### Karten suchen
 
 - **Effekt statt Name:** Die Suche im Deck-Editor findet Karten über Namen *oder* Wirkung. „Auto“ mischt beides, „Name“ bleibt beim reinen Namensabgleich, „Effekt“ durchsucht nur den Oracle-Text.
+- **Semantik:** Der Modus „Semantik“ sucht über einen Vektorindex aller 39.288 Karten. Deutsche Strategie-Anfragen wie „Länder opfern und daraus Mana ziehen“ oder „Schutz gegen Boardwipes“ treffen Karten über Mechanik und Text, auch wenn das Stichwort nicht wörtlich im Oracle-Text steht. Der Index liegt lokal in `card_embedding` (bge-m3, 1024 Dimensionen) und wird über Ollama gebaut.
 - Deutsch wird über ein Glossar auf die englischen Oracle-Begriffe abgebildet; Scryfall-Tags (Boardwipe, Tutor, Ramp, Friedhofshass …) liefern die präzisen Treffer. Treffer zeigen ihre Tags und die Textstelle, die gepasst hat.
 - **Ganze Sätze:** Enter schickt die Anfrage durch das kleine Modell `cardquery`, das englische Begriffe und Tags zurückgibt. Das Ergebnis landet in `card_query_cache`; beim zweiten Mal ist die Suche sofort da. Fällt das Modell aus, greift die Stichwortsuche.
 - **Im Deck automatisch gefiltert:** Farbidentität des Commanders und Commander-Legalität sind an, solange man eine Karte zum offenen Deck hinzufügt. Bei der Commander-Suche gibt es keinen Filter.
@@ -125,6 +140,10 @@ Beim ersten Start dauert der Import etwa zehn Sekunden. Er legt `data/kommandoze
 - Pro Karte: Scryfall-Printings, MPCFill-Community-Arts, eigene Bild-URL.
 - Art-Auswahl wird pro Karte gespeichert. Sie ändert nie die Deck-Legalität, weil die Deckliste an `oracle_id` hängt.
 - Deckliste als Text für den Import in die separate Druck-App.
+- **Export mit Arts:** „Deckliste + Arts“ schreibt pro Karte Quelle (MPCFill/Scryfall/Custom), Art-ID, Artist und URL. „TSV“ liefert dieselbe Liste maschinenlesbar. Der Endpoint ist `/api/decks/:id/export?arts=1` bzw. `?format=tsv`.
+- **Doppelseitige Karten:** Im Karten-Dialog dreht ein Klick auf das Bild die Karte. Die Art lässt sich für Vorder- und Rückseite getrennt wählen. Der Arts-Export enthält 100 Karten **plus X Rückseiten** (Text: eigene `Rückseiten`-Sektion, TSV: `board=back` und `face=back`).
+- **MTG Proxy Lab:** liest `<deck>-arts.tsv` und `<deck>-arts.txt` direkt und übernimmt MPCFill-Drive-IDs, exakte Scryfall-Printings und Custom-URLs unverändert. Die reine `.txt`-Liste enthält keine Arts.
+- **CLI-Export:** `bun run export:deck <deck-id-oder-name>` schreibt `exports/<name>.txt`, `exports/<name>-arts.txt` und `exports/<name>-arts.tsv`.
 
 ### 1-Win-Karten
 
@@ -145,6 +164,7 @@ React 19 (Bun-Build) ── REST ── Hono API ── SQLite
 - **Web:** React 19, Hono, selbst geschriebenes CSS mit Hallmark-Stamp
 - **DB:** SQLite, Drizzle-frei, `bun:sqlite`, FTS5 für Karten und Regeln
 - **AI:** `opencode run --agent commander --model ollama-cloud/deepseek-v4.1-flash:1017`
+- **Vektor-Suche:** bge-m3 über Ollama; Vektoren als normierte Float32-BLOBs in `card_embedding`, Suche per Kosinus im Speicher
 - **Bilder:** Scryfall und MPCFill, serverseitig gefetcht und gecacht
 - **Daten:** `data/kommandozentrale.db`, `data/cache/`
 

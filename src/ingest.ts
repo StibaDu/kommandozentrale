@@ -263,6 +263,7 @@ async function main() {
     .query("SELECT (SELECT COUNT(*) FROM card) AS cards, (SELECT COUNT(*) FROM card_tag) AS tags, (SELECT COUNT(*) FROM cr_rule) AS rules, (SELECT COUNT(*) FROM ruling) AS rulings")
     .get() as any
   console.log(counts)
+  console.log("Vektor-Index: `bun run embed` ausführen, damit die semantische Suche den neuen Kartenstand nutzt.")
 }
 
 main().catch((err) => {

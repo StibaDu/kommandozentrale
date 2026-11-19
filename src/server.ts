@@ -30,9 +30,16 @@ import { BRACKETS } from "./lib/rules-seed"
 import { isSkippedSection, parseDeckList, type ParsedEntry } from "./lib/import"
 import { doctorDeck } from "./lib/doctor"
 import { DEFAULT_SETTINGS, SETTING_LABELS, type BracketId, type Card, type DeckCard, type DeckSettings, type Role } from "./lib/types"
-import { getGermanCardText, getMpcFillArt, getPrintings, getRulings, scryfallCrop, scryfallArt, scryfallJson } from "./lib/scryfall"
-import { searchCards, searchStructured, ftsMatchForTerm, type SearchHit, type SearchMode, type SearchOptions } from "./lib/cardsearch"
-import { mergeVision, visionCandidates, visionSpecs } from "./lib/vision"
+import { getGermanCardText, getMpcFillArt, getPrintings, getRulings, scryfallCrop, scryfallArt, scryfallBackArt, scryfallBackCrop, scryfallJson, type ArtOption } from "./lib/scryfall"
+import { searchCards, searchStructured, semanticSearch, semanticSearchMany, ftsMatchForTerm, type SearchHit, type SearchMode, type SearchOptions } from "./lib/cardsearch"
+import { combineVision, mergeVision, visionCandidates, visionSpecs, visionVectorCandidates, type VisionCandidate } from "./lib/vision"
+import { enforceTheme, themeCandidates, themeTarget } from "./lib/themes"
+import { simulateDeck, type SimulationTheme } from "./lib/simulation"
+import { improveDeck, applyChatDeckSwaps, type ImprovementResult, type ChatDeckSwap } from "./lib/improve"
+import { askDeckChat, type DeckChatMessage } from "./lib/chat"
+import { buildDeckIdea, type DeckIdea } from "./lib/ideas"
+import { embeddingStatus } from "./lib/embeddings"
+import { buildDeckArtList, buildDeckArtTsv, buildDeckList, deckExportFilename, enrichDeckBacks, loadDeckExport } from "./lib/export"
 import { translateComboTexts, type ComboTextInput } from "./lib/translate"
 
 const PORT = Number(process.env.PORT ?? 4173)
@@ -230,6 +237,7 @@ function lanAddress(): string | null {
 }
 
 function mdnsHostname(): string | null {
+  if (process.platform === "win32") return null
   let raw = ""
   try {
     raw = execFileSync("scutil", ["--get", "LocalHostName"], {
@@ -506,6 +514,7 @@ type CommanderSuggestionPayload = {
   image_uris: any
   edhrec_rank: number | null
   reason: string
+  idea?: DeckIdea
 }
 
 const COMMANDER_STOPWORDS = new Set(
@@ -705,6 +714,45 @@ function commanderCandidates(brief: string): CommanderCandidate[] {
   return cards.map((card) => ({ card, tags: tagMap.get(card.oracle_id) ?? [] }))
 }
 
+/** Semantische Commander-Kandidaten aus der Vision. Ergänzt die lexikalische
+ *  Suche, wenn die Vision eine Strategie beschreibt, ohne die Stichwörter der
+ *  Commander-Texte zu nennen. */
+async function vectorCommanderCandidates(brief: string): Promise<CommanderCandidate[]> {
+  const specs = visionSpecs(brief)
+  const queries = specs.length ? specs.map((spec) => spec.label) : [brief.slice(0, 2000)]
+  const resultSets = await semanticSearchMany(
+    queries,
+    { legendaryCommander: true, commanderLegal: true, excludeBasicLands: true },
+    10,
+  )
+  const cards = new Map<string, Card>()
+  for (const hits of resultSets) {
+    for (const hit of hits) {
+      const card = hit.card
+      if (card.is_one_win || !card.is_legendary || !card.is_creature) continue
+      if (card.legalities.commander !== "legal") continue
+      cards.set(card.oracle_id, card)
+      if (cards.size >= 90) break
+    }
+    if (cards.size >= 90) break
+  }
+  const list = [...cards.values()]
+  const tagMap = tagsFor(list.map((card) => card.oracle_id))
+  return list.map((card) => ({ card, tags: tagMap.get(card.oracle_id) ?? [] }))
+}
+
+function mergeCommanderCandidates(base: CommanderCandidate[], extra: CommanderCandidate[], cap = 300): CommanderCandidate[] {
+  const merged = [...base]
+  const seen = new Set(base.map((candidate) => candidate.card.oracle_id))
+  for (const candidate of extra) {
+    if (seen.has(candidate.card.oracle_id)) continue
+    seen.add(candidate.card.oracle_id)
+    merged.push(candidate)
+    if (merged.length >= cap) break
+  }
+  return merged
+}
+
 function commanderSuggestion(card: Card, reason: string): CommanderSuggestionPayload {
   return {
     oracle_id: card.oracle_id,
@@ -763,6 +811,51 @@ function mapAiCommanderSuggestions(
   return out
 }
 
+function simulationThemeFor(brief: string, commander: Card, settings: DeckSettings): SimulationTheme | null {
+  const hits = themeCandidates(brief, commander, settings)
+  if (!hits.length) return null
+  return {
+    label: hits[0]?.theme?.label ?? "Theme",
+    ids: Array.from(new Set(hits.map((hit) => hit.card.oracle_id))),
+    target: themeTarget(hits.length),
+  }
+}
+
+function parseStringArray(value: unknown): string[] {
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) : value
+    return Array.isArray(parsed) ? parsed.map(String).slice(0, 8) : []
+  } catch {
+    return []
+  }
+}
+
+function chatProposalPayload(row: any) {
+  return {
+    id: row.id,
+    cut_name: row.cut_name,
+    add_name: row.add_name,
+    reason: row.reason,
+    fixes: parseStringArray(row.fixes_json),
+    status: row.status,
+    created_at: row.created_at,
+    applied_at: row.applied_at ?? null,
+  }
+}
+
+function saveSimulationReport(deckId: string, deckUpdatedAt: string, report: unknown) {
+  db.query("INSERT INTO deck_simulation(id, deck_id, deck_updated_at, report_json, created_at) VALUES (?,?,?,?,?)").run(
+    crypto.randomUUID(),
+    deckId,
+    deckUpdatedAt,
+    JSON.stringify(report),
+    new Date().toISOString(),
+  )
+  db.query(
+    "DELETE FROM deck_simulation WHERE deck_id = ? AND id NOT IN (SELECT id FROM deck_simulation WHERE deck_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 5)",
+  ).run(deckId, deckId)
+}
+
 function loadDeck(id: string) {
   const d = db.query("SELECT * FROM deck WHERE id = ?").get(id) as any
   if (!d) return null
@@ -773,11 +866,15 @@ function loadDeck(id: string) {
         printing_id: d.commander_printing_id ?? null,
         art_url: d.commander_art_url ?? null,
         artist: d.commander_artist ?? null,
+        back_printing_id: d.commander_back_printing_id ?? null,
+        back_art_url: d.commander_back_art_url ?? null,
+        back_artist: d.commander_back_artist ?? null,
       }
     : null
   const rows = db
     .query(
-      `SELECT c.*, dc.role, dc.category, dc.reason, dc.printing_id, dc.art_url, dc.artist, dc.quantity, dc.sort_order, dc.board
+      `SELECT c.*, dc.role, dc.category, dc.reason, dc.printing_id, dc.art_url, dc.artist,
+              dc.back_printing_id, dc.back_art_url, dc.back_artist, dc.quantity, dc.sort_order, dc.board
        FROM deck_card dc JOIN card c ON c.oracle_id = dc.oracle_id
        WHERE dc.deck_id = ?
        ORDER BY CASE WHEN dc.board = 'maybeboard' THEN 1 ELSE 0 END, dc.sort_order`,
@@ -792,6 +889,9 @@ function loadDeck(id: string) {
     printing_id: r.printing_id ?? null,
     art_url: r.art_url ?? null,
     artist: r.artist ?? null,
+    back_printing_id: r.back_printing_id ?? null,
+    back_art_url: r.back_art_url ?? null,
+    back_artist: r.back_artist ?? null,
     quantity: Number(r.quantity ?? 1),
     is_commander: false,
     tags: tagMap.get(r.oracle_id) ?? [],
@@ -805,6 +905,17 @@ function loadDeck(id: string) {
   const owner = d.owner_user_id
     ? (db.query("SELECT display_name, avatar_color FROM users WHERE id = ?").get(d.owner_user_id) as any)
     : null
+  const simulationRow = db
+    .query("SELECT report_json FROM deck_simulation WHERE deck_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+    .get(id) as any
+  let simulation: any = null
+  if (simulationRow) {
+    try {
+      simulation = JSON.parse(simulationRow.report_json)
+    } catch {
+      simulation = null
+    }
+  }
   return {
     id: d.id,
     name: d.name,
@@ -827,6 +938,7 @@ function loadDeck(id: string) {
     cards,
     maybeboard,
     analysis,
+    simulation,
   }
 }
 
@@ -877,6 +989,9 @@ function snapshotDeck(deckId: string, label: string): string | null {
     printing_id: card.printing_id,
     art_url: card.art_url,
     artist: card.artist,
+    back_printing_id: card.back_printing_id,
+    back_art_url: card.back_art_url,
+    back_artist: card.back_artist,
   }))
   db.query("INSERT INTO deck_revision(id, deck_id, created_at, label, cards_json) VALUES (?,?,?,?,?)").run(
     revisionId,
@@ -1031,11 +1146,21 @@ async function runBuild(deckId: string, runId: string) {
     const commander = deck.commander as any
     if (commander.is_one_win) throw new Error("Der Commander ist eine 1-Win-Karte. 1-Win-Karten sind ausgeschlossen.")
     const basePool = buildPool(commander, deck.settings)
-    const visionHits = visionCandidates(deck.brief ?? "", commander, deck.settings)
+    const themeHits = themeCandidates(deck.brief ?? "", commander, deck.settings)
+    const lexicalHits = visionCandidates(deck.brief ?? "", commander, deck.settings)
+    let vectorHits: VisionCandidate[] = []
+    try {
+      vectorHits = await visionVectorCandidates(deck.brief ?? "", commander, deck.settings)
+    } catch (error) {
+      console.error("Semantischer Vision-Retriever fehlgeschlagen:", error)
+    }
+    const visionHits = combineVision(themeHits, lexicalHits, vectorHits)
     const pool = mergeVision(basePool, visionHits)
     if (pool.length < 80) throw new Error(`Zu wenige Kandidaten (${pool.length}). Ist der Scryfall-Import vollständig?`)
     db.query("UPDATE build_run SET candidate_count = ?, card_count = 1 WHERE id = ?").run(pool.length, runId)
-    const visionNote = visionHits.length ? `, davon ${visionHits.length} Treffer aus der Deck-Vision` : ""
+    const visionNote = visionHits.length
+      ? `, davon ${visionHits.length} strategische Treffer (${themeHits.length} Theme, ${lexicalHits.length} lexikalisch, ${vectorHits.length} semantisch)`
+      : ""
     update(
       "running",
       `DeepSeek V4.1 Flash prüft ${pool.length} Kandidaten${visionNote}; ${Math.min(pool.length, AI_CANDIDATE_LIMIT)} gehen in den Kontext.`,
@@ -1080,22 +1205,93 @@ async function runBuild(deckId: string, runId: string) {
       cards = fixed
     }
     cards = tuneToBracket(cards, deck.bracket, pool, deck.settings, commander)
+    if (themeHits.length) {
+      cards = enforceTheme(cards, themeHits, commander, deck.settings, deck.bracket)
+    }
     if (isCancelled()) {
       await recordAiCost("build_run", runId, sessionID)
       return
     }
+    update("running", "Simulation: Eröffnungshände, Goldfish, Schwächen und tote Karten. Danach prüft der KI-Doctor das Deck.")
+    let improvement: ImprovementResult | null = null
+    try {
+      improvement = await improveDeck({
+        commander,
+        cards,
+        settings: deck.settings,
+        bracket: deck.bracket,
+        podSize: deck.pod_size,
+        brief: deck.brief ?? "",
+        pool,
+        theme: simulationThemeFor(deck.brief ?? "", commander, deck.settings),
+      })
+      cards = improvement.cards
+      update(
+        "running",
+        improvement.applied.length
+          ? `KI-Doctor: Score ${improvement.before.score} → ${improvement.after.score}; ${improvement.applied.length} Karten ersetzt.`
+          : `Simulation: Score ${improvement.after.score}; keine Änderung nötig.`,
+      )
+    } catch (err) {
+      console.error("Simulation/KI-Doctor fehlgeschlagen:", err)
+    }
+    if (isCancelled()) {
+      await recordAiCost("build_run", runId, sessionID)
+      return
+    }
+    const finalUpdatedAt = new Date().toISOString()
     db.query("UPDATE build_run SET card_count = 100 WHERE id = ? AND status <> 'cancelled'").run(runId)
     saveDeckCards(deckId, cards)
     db.query("UPDATE deck SET name = ?, primer = ?, status = 'ready', updated_at = ? WHERE id = ?").run(
       name || `${commander.name} – Deck`,
       primer || primerFallback(commander, cards, deck.bracket, deck.pod_size),
-      new Date().toISOString(),
+      finalUpdatedAt,
       deckId,
     )
+    let simulationReport: any = improvement
+      ? {
+          ...improvement.after,
+          deckUpdatedAt: finalUpdatedAt,
+          improvement: {
+            beforeScore: improvement.before.score,
+            afterScore: improvement.after.score,
+            applied: improvement.applied,
+            rejected: improvement.rejected,
+            assessment: improvement.assessment,
+          },
+        }
+      : null
+    if (!simulationReport) {
+      try {
+        simulationReport = {
+          ...simulateDeck(
+            commander,
+            cards,
+            deck.settings,
+            deck.bracket,
+            simulationThemeFor(deck.brief ?? "", commander, deck.settings),
+          ),
+          deckUpdatedAt: finalUpdatedAt,
+        }
+      } catch (err) {
+        console.error("Fallback-Simulation fehlgeschlagen:", err)
+      }
+    }
+    if (simulationReport) saveSimulationReport(deckId, finalUpdatedAt, simulationReport)
     if (error) db.query("UPDATE build_run SET error = ? WHERE id = ?").run(error, runId)
     await recordAiCost("build_run", runId, sessionID)
+    const themeCount = themeHits.length
+      ? cards.reduce((sum, card) => sum + (themeHits.some((hit) => hit.card.oracle_id === card.oracle_id) ? card.quantity : 0), 0)
+      : 0
+    const themeLabel = themeHits[0]?.theme?.label
+    const themeSuffix = themeLabel ? ` Thema ${themeLabel}: ${themeCount} Karten.` : ""
+    const simulationSuffix = improvement
+      ? ` Simulation: Score ${improvement.before.score} → ${improvement.after.score}.${
+          improvement.applied.length ? ` ${improvement.applied.length} Karten ersetzt.` : " Keine Änderung."
+        }`
+      : ""
     db.query("UPDATE build_run SET status = 'done', message = ?, provider = ?, model = ?, card_count = 100, finished_at = ? WHERE id = ? AND status <> 'cancelled'").run(
-      "Deck fertig.",
+      `Deck fertig.${themeSuffix}${simulationSuffix}`,
       provider,
       provider === "opencode" ? AI_MODEL : "engine",
       new Date().toISOString(),
@@ -1360,6 +1556,7 @@ app.get("/api/meta", (c) => {
 })
 
 app.get("/api/network", (c) => c.json(networkInfo()))
+app.get("/api/embeddings", (c) => c.json(embeddingStatus()))
 
 app.get("/api/mobile/qr.svg", async (c) => {
   const requested = (c.req.query("url") ?? "").trim().slice(0, 2048)
@@ -1393,7 +1590,7 @@ function searchOptionsFrom(c: Context<AppEnv>, limit: number): SearchOptions {
   const colorIdentity =
     colorRaw === undefined ? undefined : [...new Set((colorRaw.toUpperCase().match(/[WUBRG]/g) ?? []) as string[])]
   const modeRaw = c.req.query("mode") ?? "auto"
-  const mode: SearchMode = modeRaw === "name" || modeRaw === "effect" ? modeRaw : "auto"
+  const mode: SearchMode = modeRaw === "name" || modeRaw === "effect" || modeRaw === "semantic" ? modeRaw : "auto"
   return {
     mode,
     limit,
@@ -1402,7 +1599,7 @@ function searchOptionsFrom(c: Context<AppEnv>, limit: number): SearchOptions {
   }
 }
 
-app.get("/api/cards/search", (c) => {
+app.get("/api/cards/search", async (c) => {
   const q = (c.req.query("q") ?? "").trim()
   const limit = Math.min(30, Math.max(1, Number(c.req.query("limit") ?? 16)))
   const opts = searchOptionsFrom(c, limit)
@@ -1427,6 +1624,15 @@ app.get("/api/cards/search", (c) => {
         matched: null,
       })),
     )
+  }
+  if (opts.mode === "semantic") {
+    try {
+      return c.json((await semanticSearch(q, opts)).map(cardSearchPayload))
+    } catch (error) {
+      console.error("Semantische Suche fehlgeschlagen:", error)
+      c.header("X-KZ-Search", "lexical-fallback")
+      return c.json(searchCards(q, { ...opts, mode: "auto" }).map(cardSearchPayload))
+    }
   }
   return c.json(searchCards(q, opts).map(cardSearchPayload))
 })
@@ -1475,6 +1681,71 @@ app.post("/api/cards/interpret", async (c) => {
   }
 })
 
+async function enrichCommanderIdeas(
+  suggestions: CommanderSuggestionPayload[],
+  brief: string,
+  bracket: BracketId,
+  settings: DeckSettings,
+): Promise<CommanderSuggestionPayload[]> {
+  return Promise.all(
+    suggestions.map(async (suggestion) => {
+      const commander = cardById(suggestion.oracle_id)
+      if (!commander) return suggestion
+      try {
+        const idea = await buildDeckIdea(commander, brief, settings, bracket, suggestion.reason)
+        return { ...suggestion, idea }
+      } catch (error) {
+        console.error(`Deck-Idee für ${suggestion.name} fehlgeschlagen:`, error)
+        return suggestion
+      }
+    }),
+  )
+}
+
+app.post("/api/commanders/preview", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as any
+  const name = String(body.commanderName ?? "").trim()
+  const commander = cardByNameExact(name)
+  if (!commander) return c.json({ error: "Commander nicht gefunden." }, 404)
+  if (commander.is_one_win) return c.json({ error: "1-Win-Karten sind ausgeschlossen." }, 400)
+  const brief = deckBrief(body.brief)
+  const bracket = ([3, 4, 5].includes(Number(body.bracket)) ? Number(body.bracket) : 4) as BracketId
+  const settings = cleanSettings(body.settings)
+  const basePool = buildPool(commander, settings)
+  const themeHits = themeCandidates(brief, commander, settings)
+  const lexicalHits = visionCandidates(brief, commander, settings)
+  let vectorHits: VisionCandidate[] = []
+  try {
+    vectorHits = await visionVectorCandidates(brief, commander, settings)
+  } catch (error) {
+    console.error("Semantische Vorschau-Suche fehlgeschlagen:", error)
+  }
+  const pool = mergeVision(basePool, combineVision(themeHits, lexicalHits, vectorHits))
+  if (pool.length < 80) return c.json({ error: `Zu wenige Kandidaten (${pool.length}).` }, 500)
+  let cards = deterministicBuild(commander, settings, bracket, pool)
+  cards = tuneToBracket(cards, bracket, pool, settings, commander)
+  if (cards.reduce((sum, card) => sum + card.quantity, 0) !== 99) {
+    cards = repairBuild(
+      cards.map((card) => ({ name: card.name, role: card.role, reason: card.reason })),
+      commander,
+      settings,
+      bracket,
+      pool,
+    )
+    cards = tuneToBracket(cards, bracket, pool, settings, commander)
+  }
+  if (themeHits.length) cards = enforceTheme(cards, themeHits, commander, settings, bracket)
+  const themeIds = new Set(themeHits.map((hit) => hit.card.oracle_id))
+  const themeCount = cards.reduce((sum, card) => sum + (themeIds.has(card.oracle_id) ? card.quantity : 0), 0)
+  return c.json({
+    cards,
+    analysis: analyzeDeck(commander, cards, settings, bracket),
+    theme: themeHits.length
+      ? { label: themeHits[0]?.theme?.label ?? "Theme", count: themeCount, target: themeTarget(themeHits.length) }
+      : null,
+  })
+})
+
 app.post("/api/commanders/suggest", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as any
   const brief = deckBrief(body.brief)
@@ -1484,7 +1755,13 @@ app.post("/api/commanders/suggest", async (c) => {
   const bracket = ([3, 4, 5].includes(Number(body.bracket)) ? Number(body.bracket) : 4) as BracketId
   const podSize = Math.max(3, Math.min(5, Number(body.podSize ?? 5)))
   const settings = cleanSettings(body.settings)
-  const candidates = commanderCandidates(brief)
+  let candidates = commanderCandidates(brief)
+  try {
+    const semanticCandidates = await vectorCommanderCandidates(brief)
+    if (semanticCandidates.length) candidates = mergeCommanderCandidates(candidates, semanticCandidates)
+  } catch (error) {
+    console.error("Semantische Commander-Suche fehlgeschlagen:", error)
+  }
   if (candidates.length === 0) return c.json({ error: "Keine Commander-Kandidaten gefunden." }, 500)
 
   try {
@@ -1499,13 +1776,15 @@ app.post("/api/commanders/suggest", async (c) => {
         suggestions.push(fallback)
       }
     }
-    return c.json({ suggestions, provider: "opencode", note: null })
+    const enriched = await enrichCommanderIdeas(suggestions, brief, bracket, settings)
+    return c.json({ suggestions: enriched, provider: "opencode", note: null })
   } catch (error) {
     console.error("Commander suggestion failed:", error)
     const suggestions = fallbackCommanderSuggestions(brief, candidates)
     if (suggestions.length === 0) return c.json({ error: "Keine Commander-Kandidaten gefunden." }, 500)
+    const enriched = await enrichCommanderIdeas(suggestions, brief, bracket, settings)
     return c.json({
-      suggestions,
+      suggestions: enriched,
       provider: "engine",
       note: "KI-Vorschlag war nicht verfügbar. Die Vorschläge sind nach Karten-Tags und EDHREC sortiert.",
     })
@@ -1542,6 +1821,9 @@ app.get("/api/cards/:oracleId/printings", async (c) => {
         name: p.name,
         imageUrl: scryfallArt(p),
         thumbnailUrl: scryfallCrop(p),
+        backImageUrl: scryfallBackArt(p) || null,
+        backThumbnailUrl: scryfallBackCrop(p) || null,
+        backArtist: p.card_faces?.[1]?.artist ?? null,
         artist: p.artist,
         setCode: p.set,
         setName: p.set_name,
@@ -1555,15 +1837,67 @@ app.get("/api/cards/:oracleId/printings", async (c) => {
   }
 })
 
+function localMpcFillArts(oracleId: string, face: "front" | "back"): ArtOption[] {
+  const rows = db
+    .query(
+      `SELECT identifier, card_name, tags_json, language, dpi, source_name, image_url, thumbnail_url
+       FROM mpcfill_art
+       WHERE oracle_id = ? AND face = ? AND nsfw = 1
+       ORDER BY dpi DESC, identifier
+       LIMIT 300`,
+    )
+    .all(oracleId, face) as any[]
+  return rows.map((row) => ({
+    source: "mpcfill" as const,
+    id: `mpcfill:${row.identifier}`,
+    name: String(row.card_name),
+    imageUrl: String(row.image_url),
+    thumbnailUrl: row.thumbnail_url
+      ? String(row.thumbnail_url)
+      : String(row.image_url).replace("w1200", "w400"),
+    dpi: row.dpi == null ? undefined : Number(row.dpi),
+    lang: row.language ?? undefined,
+    tags: (() => {
+      try {
+        const tags = JSON.parse(row.tags_json ?? "[]")
+        return Array.isArray(tags) ? tags.map(String) : []
+      } catch {
+        return []
+      }
+    })(),
+    note: row.source_name ?? "MPCFill NSFW",
+  }))
+}
+
 app.get("/api/cards/:oracleId/mpcfill", async (c) => {
   const card = cardById(c.req.param("oracleId"))
   if (!card) return c.json({ error: "Karte nicht gefunden." }, 404)
+  const face = c.req.query("face") === "back" ? "back" : "front"
+  const faceName =
+    face === "back"
+      ? card.card_faces?.[1]?.name?.trim()
+      : card.card_faces?.[0]?.name?.trim()
+  const queryName = faceName || card.name
+  const local = localMpcFillArts(card.oracle_id, face)
+
+  let live: ArtOption[] = []
+  let error: string | undefined
   try {
-    const arts = await getMpcFillArt(card.name)
-    return c.json({ arts })
+    const timeout = Bun.sleep(8000).then(() => {
+      throw new Error("MPCFill-Zeitüberschreitung")
+    })
+    live = await Promise.race([getMpcFillArt(queryName), timeout])
+    if (!live.length && queryName !== card.name) {
+      live = await Promise.race([getMpcFillArt(card.name), timeout])
+    }
   } catch (err) {
-    return c.json({ arts: [], error: String(err) })
+    error = err instanceof Error ? err.message : String(err)
   }
+
+  const byId = new Map<string, ArtOption>()
+  for (const art of local) byId.set(art.id, art)
+  for (const art of live) if (!byId.has(art.id)) byId.set(art.id, art)
+  return c.json({ arts: [...byId.values()], ...(error ? { error } : {}) })
 })
 
 app.get("/api/cards/:oracleId/rulings", async (c) => {
@@ -1817,6 +2151,9 @@ app.post("/api/decks/import", async (c) => {
       printing_id: null,
       art_url: null,
       artist: null,
+      back_printing_id: null,
+      back_art_url: null,
+      back_artist: null,
       quantity: entry.quantity,
       is_commander: false,
       tags,
@@ -1966,6 +2303,182 @@ app.get("/api/decks/:id", (c) => {
   return deck ? c.json(deck) : c.json({ error: "Deck nicht gefunden." }, 404)
 })
 
+app.get("/api/decks/:id/chat", (c) => {
+  const id = c.req.param("id")
+  const deck = db.query("SELECT id FROM deck WHERE id = ?").get(id)
+  if (!deck) return c.json({ error: "Deck nicht gefunden." }, 404)
+  const messages = db
+    .query(
+      "SELECT id, role, content, model, created_at FROM deck_chat_message WHERE deck_id = ? ORDER BY created_at ASC, rowid ASC LIMIT 200",
+    )
+    .all(id) as any[]
+  const proposals = db
+    .query(
+      "SELECT id, message_id, cut_name, add_name, reason, fixes_json, status, created_at, applied_at FROM deck_chat_proposal WHERE deck_id = ? ORDER BY created_at ASC, rowid ASC",
+    )
+    .all(id) as any[]
+  const byMessage = new Map<string, any[]>()
+  for (const proposal of proposals) {
+    const list = byMessage.get(proposal.message_id) ?? []
+    list.push(chatProposalPayload(proposal))
+    byMessage.set(proposal.message_id, list)
+  }
+  return c.json({ messages: messages.map((message) => ({ ...message, proposals: byMessage.get(message.id) ?? [] })) })
+})
+
+app.post("/api/decks/:id/chat", async (c) => {
+  const id = c.req.param("id")
+  const deck = loadDeck(id)
+  if (!deck) return c.json({ error: "Deck nicht gefunden." }, 404)
+  if (!canEditDeck(c, id)) return c.json({ error: "Nur der Besitzer kann mit der KI über dieses Deck sprechen." }, 403)
+  if (!deck.commander) return c.json({ error: "Deck oder Commander nicht gefunden." }, 400)
+  const body = (await c.req.json().catch(() => ({}))) as any
+  const message = String(body.message ?? "")
+    .replace(/\u0000/g, "")
+    .trim()
+    .slice(0, 2000)
+  if (!message) return c.json({ error: "Bitte eine Nachricht eingeben." }, 400)
+  const prior = db
+    .query(
+      "SELECT role, content FROM deck_chat_message WHERE deck_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 12",
+    )
+    .all(id)
+    .reverse() as DeckChatMessage[]
+  const createdAt = new Date().toISOString()
+  const userMessage = { id: crypto.randomUUID(), role: "user", content: message, created_at: createdAt }
+  db.query("INSERT INTO deck_chat_message(id, deck_id, role, content, created_at) VALUES (?,?,?,?,?)").run(
+    userMessage.id,
+    id,
+    "user",
+    message,
+    createdAt,
+  )
+  try {
+    const answer = await askDeckChat(deck, message, prior)
+    const reply = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: answer.text,
+      model: answer.model,
+      created_at: new Date().toISOString(),
+    }
+    db.query(
+      "INSERT INTO deck_chat_message(id, deck_id, role, content, model, session_id, created_at) VALUES (?,?,?,?,?,?,?)",
+    ).run(reply.id, id, "assistant", reply.content, reply.model, answer.sessionID, reply.created_at)
+    const proposals = answer.swaps.map((swap) => {
+      const proposal = {
+        id: crypto.randomUUID(),
+        cut_name: swap.cut,
+        add_name: swap.add,
+        reason: swap.reason,
+        fixes: swap.fixes,
+        status: "open",
+        created_at: reply.created_at,
+        applied_at: null,
+      }
+      db.query(
+        "INSERT INTO deck_chat_proposal(id, message_id, deck_id, cut_name, add_name, reason, fixes_json, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+      ).run(
+        proposal.id,
+        reply.id,
+        id,
+        proposal.cut_name,
+        proposal.add_name,
+        proposal.reason,
+        JSON.stringify(proposal.fixes),
+        proposal.status,
+        proposal.created_at,
+      )
+      return proposal
+    })
+    db.query(
+      "DELETE FROM deck_chat_message WHERE deck_id = ? AND id NOT IN (SELECT id FROM deck_chat_message WHERE deck_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 200)",
+    ).run(id, id)
+    db.query(
+      "DELETE FROM deck_chat_proposal WHERE deck_id = ? AND message_id NOT IN (SELECT id FROM deck_chat_message WHERE deck_id = ?)",
+    ).run(id, id)
+    return c.json({ user: userMessage, reply: { ...reply, proposals } })
+  } catch (err) {
+    db.query("DELETE FROM deck_chat_message WHERE id = ?").run(userMessage.id)
+    return c.json(
+      {
+        user: userMessage,
+        error: `Die KI konnte nicht antworten: ${err instanceof Error ? err.message : String(err)}`,
+      },
+      502,
+    )
+  }
+})
+
+app.post("/api/decks/:id/chat/apply", async (c) => {
+  const id = c.req.param("id")
+  const row = db.query("SELECT id FROM deck WHERE id = ?").get(id)
+  if (!row) return c.json({ error: "Deck nicht gefunden." }, 404)
+  if (!canEditDeck(c, id)) return c.json({ error: "Nur der Besitzer darf diese Vorschläge übernehmen." }, 403)
+  const body = (await c.req.json().catch(() => ({}))) as any
+  const requested: string[] = Array.isArray(body.proposalIds)
+    ? body.proposalIds.map((value: unknown) => String(value)).slice(0, 12)
+    : []
+  const ids: string[] = [...new Set(requested.filter(Boolean))]
+  if (!ids.length) return c.json({ error: "Keine Vorschläge ausgewählt." }, 400)
+  const placeholders = ids.map(() => "?").join(",")
+  const proposals = db
+    .query(
+      `SELECT id, cut_name, add_name, reason, fixes_json FROM deck_chat_proposal WHERE deck_id = ? AND status = 'open' AND id IN (${placeholders})`,
+    )
+    .all(id, ...ids) as any[]
+  if (!proposals.length) return c.json({ error: "Keine offenen Vorschläge gefunden." }, 400)
+  const deck = loadDeck(id)
+  if (!deck || !deck.commander) return c.json({ error: "Deck oder Commander nicht gefunden." }, 400)
+  const swaps: ChatDeckSwap[] = proposals.map((proposal) => ({
+    id: proposal.id,
+    cut: proposal.cut_name,
+    add: proposal.add_name,
+    reason: proposal.reason,
+    fixes: parseStringArray(proposal.fixes_json),
+  }))
+  const result = applyChatDeckSwaps({
+    commander: deck.commander as any,
+    cards: deck.cards,
+    settings: deck.settings,
+    bracket: deck.bracket,
+    theme: simulationThemeFor(deck.brief, deck.commander as any, deck.settings),
+    swaps,
+  })
+  if (!result.applied.length) {
+    return c.json({
+      deck,
+      applied: [],
+      rejected: result.rejected,
+      error: "Keine der ausgewählten Änderungen ist gültig.",
+    })
+  }
+  const revisionId = snapshotDeck(id, "Vor Chat-Swap")
+  saveDeckCards(id, result.cards)
+  const finalUpdatedAt = new Date().toISOString()
+  db.query("UPDATE deck SET updated_at = ? WHERE id = ?").run(finalUpdatedAt, id)
+  const appliedAt = new Date().toISOString()
+  const updateProposal = db.prepare(
+    "UPDATE deck_chat_proposal SET status = 'applied', applied_at = ? WHERE id = ? AND deck_id = ? AND status = 'open'",
+  )
+  for (const swap of result.applied) {
+    if (swap.id) updateProposal.run(appliedAt, swap.id, id)
+  }
+  try {
+    const report = simulateDeck(
+      deck.commander as any,
+      result.cards,
+      deck.settings,
+      deck.bracket,
+      simulationThemeFor(deck.brief, deck.commander as any, deck.settings),
+    )
+    saveSimulationReport(id, finalUpdatedAt, { ...report, deckUpdatedAt: finalUpdatedAt })
+  } catch (err) {
+    console.error("Simulation nach Chat-Swap fehlgeschlagen:", err)
+  }
+  return c.json({ deck: loadDeck(id), applied: result.applied, rejected: result.rejected, revisionId })
+})
+
 app.post("/api/decks/:id/save", async (c) => {
   const id = c.req.param("id")
   const row = db.query("SELECT * FROM deck WHERE id = ?").get(id) as any
@@ -2006,8 +2519,8 @@ app.post("/api/decks/:id/copy", (c) => {
   const copyId = crypto.randomUUID()
   const now = new Date().toISOString()
   db.query(
-    `INSERT INTO deck(id,name,commander_oracle_id,commander_name,commander_printing_id,commander_art_url,commander_artist,bracket,pod_size,settings_json,brief,primer,status,saved_at,created_at,updated_at,owner_user_id,visibility)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO deck(id,name,commander_oracle_id,commander_name,commander_printing_id,commander_art_url,commander_artist,commander_back_printing_id,commander_back_art_url,commander_back_artist,bracket,pod_size,settings_json,brief,primer,status,saved_at,created_at,updated_at,owner_user_id,visibility)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     copyId,
     `${source.name} – Kopie`,
@@ -2016,6 +2529,9 @@ app.post("/api/decks/:id/copy", (c) => {
     source.commander_printing_id ?? null,
     source.commander_art_url ?? null,
     source.commander_artist ?? null,
+    source.commander_back_printing_id ?? null,
+    source.commander_back_art_url ?? null,
+    source.commander_back_artist ?? null,
     source.bracket,
     source.pod_size,
     JSON.stringify(settingsFor(source)),
@@ -2029,8 +2545,8 @@ app.post("/api/decks/:id/copy", (c) => {
     "group",
   )
   db.query(
-    `INSERT INTO deck_card(deck_id,oracle_id,quantity,category,role,reason,printing_id,art_url,artist,sort_order,is_commander,board)
-     SELECT ?, dc.oracle_id, dc.quantity, dc.category, dc.role, dc.reason, dc.printing_id, dc.art_url, dc.artist, dc.sort_order, 0, dc.board
+    `INSERT INTO deck_card(deck_id,oracle_id,quantity,category,role,reason,printing_id,art_url,artist,back_printing_id,back_art_url,back_artist,sort_order,is_commander,board)
+     SELECT ?, dc.oracle_id, dc.quantity, dc.category, dc.role, dc.reason, dc.printing_id, dc.art_url, dc.artist, dc.back_printing_id, dc.back_art_url, dc.back_artist, dc.sort_order, 0, dc.board
      FROM deck_card dc
      JOIN card c ON c.oracle_id = dc.oracle_id
      WHERE dc.deck_id = ? AND c.is_one_win = 0 ${identityFilter}`,
@@ -2114,6 +2630,23 @@ app.post("/api/builds/:id/cancel", (c) => {
   }
   const current = db.query("SELECT status FROM build_run WHERE id = ?").get(id) as any
   return c.json({ ok: true, status: current?.status ?? row.status })
+})
+
+app.post("/api/decks/:id/simulate", (c) => {
+  const id = c.req.param("id")
+  const deck = loadDeck(id)
+  if (!deck) return c.json({ error: "Deck nicht gefunden." }, 404)
+  if (!canEditDeck(c, id)) return c.json({ error: "Nur der Besitzer darf dieses Deck simulieren." }, 403)
+  if (!deck.commander || !deck.cards.length) return c.json({ error: "Deck oder Commander nicht gefunden." }, 400)
+  const report = simulateDeck(
+    deck.commander,
+    deck.cards,
+    deck.settings,
+    deck.bracket,
+    simulationThemeFor(deck.brief, deck.commander, deck.settings),
+  )
+  saveSimulationReport(id, deck.updated_at, { ...report, deckUpdatedAt: deck.updated_at })
+  return c.json(loadDeck(id))
 })
 
 app.post("/api/decks/:id/cards", async (c) => {
@@ -2237,15 +2770,28 @@ app.post("/api/decks/:id/cards/:oracleId/art", async (c) => {
   const oracleId = c.req.param("oracleId")
   if (!canEditDeck(c, id)) return c.json({ error: "Nur der Besitzer darf dieses Deck ändern." }, 403)
   const body = (await c.req.json()) as any
+  const face = body.face === "back" ? "back" : "front"
+  const now = new Date().toISOString()
   const deckRow = db.query("SELECT commander_oracle_id FROM deck WHERE id = ?").get(id) as any
   if (deckRow?.commander_oracle_id === oracleId) {
-    db.query("UPDATE deck SET commander_printing_id = ?, commander_art_url = ?, commander_artist = ?, updated_at = ? WHERE id = ?").run(
-      body.printingId ?? null,
-      body.artUrl ?? null,
-      body.artist ?? null,
-      new Date().toISOString(),
-      id,
-    )
+    if (face === "back") {
+      db.query(
+        "UPDATE deck SET commander_back_printing_id = ?, commander_back_art_url = ?, commander_back_artist = ?, updated_at = ? WHERE id = ?",
+      ).run(body.printingId ?? null, body.artUrl ?? null, body.artist ?? null, now, id)
+    } else {
+      db.query(
+        "UPDATE deck SET commander_printing_id = ?, commander_art_url = ?, commander_artist = ?, updated_at = ? WHERE id = ?",
+      ).run(body.printingId ?? null, body.artUrl ?? null, body.artist ?? null, now, id)
+      if (typeof body.backArtUrl === "string" && body.backArtUrl) {
+        db.query(
+          "UPDATE deck SET commander_back_printing_id = ?, commander_back_art_url = ?, commander_back_artist = ? WHERE id = ?",
+        ).run(body.backPrintingId ?? body.printingId ?? null, body.backArtUrl, body.backArtist ?? null, id)
+      }
+    }
+  } else if (face === "back") {
+    db.query(
+      "UPDATE deck_card SET back_printing_id = ?, back_art_url = ?, back_artist = ? WHERE deck_id = ? AND oracle_id = ?",
+    ).run(body.printingId ?? null, body.artUrl ?? null, body.artist ?? null, id, oracleId)
   } else {
     db.query("UPDATE deck_card SET printing_id = ?, art_url = ?, artist = ? WHERE deck_id = ? AND oracle_id = ?").run(
       body.printingId ?? null,
@@ -2254,8 +2800,13 @@ app.post("/api/decks/:id/cards/:oracleId/art", async (c) => {
       id,
       oracleId,
     )
+    if (typeof body.backArtUrl === "string" && body.backArtUrl) {
+      db.query(
+        "UPDATE deck_card SET back_printing_id = ?, back_art_url = ?, back_artist = ? WHERE deck_id = ? AND oracle_id = ?",
+      ).run(body.backPrintingId ?? body.printingId ?? null, body.backArtUrl, body.backArtist ?? null, id, oracleId)
+    }
   }
-  db.query("UPDATE deck SET updated_at = ? WHERE id = ?").run(new Date().toISOString(), id)
+  db.query("UPDATE deck SET updated_at = ? WHERE id = ?").run(now, id)
   return c.json({ ok: true })
 })
 
@@ -2379,6 +2930,9 @@ app.post("/api/decks/:id/doctor/apply", async (c) => {
     printing_id: card.printing_id,
     art_url: card.art_url,
     artist: card.artist,
+    back_printing_id: card.back_printing_id,
+    back_art_url: card.back_art_url,
+    back_artist: card.back_artist,
   }))
   db.query("INSERT INTO deck_revision(id, deck_id, created_at, label, cards_json) VALUES (?,?,?,?,?)").run(
     revisionId,
@@ -2456,6 +3010,9 @@ app.post("/api/decks/:id/revisions/:revisionId/restore", (c) => {
       printing_id: row.printing_id ?? null,
       art_url: row.art_url ?? null,
       artist: row.artist ?? null,
+      back_printing_id: row.back_printing_id ?? null,
+      back_art_url: row.back_art_url ?? null,
+      back_artist: row.back_artist ?? null,
     })
   }
   const now = new Date().toISOString()
@@ -2469,6 +3026,9 @@ app.post("/api/decks/:id/revisions/:revisionId/restore", (c) => {
     printing_id: card.printing_id,
     art_url: card.art_url,
     artist: card.artist,
+    back_printing_id: card.back_printing_id,
+    back_art_url: card.back_art_url,
+    back_artist: card.back_artist,
   }))
   db.query("INSERT INTO deck_revision(id, deck_id, created_at, label, cards_json) VALUES (?,?,?,?,?)").run(
     undoRevisionId,
@@ -2609,19 +3169,31 @@ app.get("/api/decks/:id/revisions", (c) => {
   return c.json({ revisions })
 })
 
-app.get("/api/decks/:id/export", (c) => {
-  const deck = loadDeck(c.req.param("id"))
+app.get("/api/decks/:id/export", async (c) => {
+  const deck = loadDeckExport(c.req.param("id"))
   if (!deck) return c.json({ error: "Deck nicht gefunden." }, 404)
-  const lines = [`1 ${deck.commander_name}`, ""]
-  for (const card of deck.cards) lines.push(`${card.quantity} ${card.name}`)
-  if (deck.maybeboard.length > 0) {
-    lines.push("", "// Maybeboard")
-    for (const card of deck.maybeboard) lines.push(`${card.quantity} ${card.name}`)
+  await enrichDeckBacks(deck)
+  const format = String(c.req.query("format") ?? "").toLowerCase()
+  const withArts = c.req.query("arts") === "1"
+  let body: string
+  let contentType = "text/plain; charset=utf-8"
+  let suffix = ""
+  let ext = "txt"
+  if (format === "tsv" || format === "csv") {
+    body = buildDeckArtTsv(deck)
+    contentType = "text/tab-separated-values; charset=utf-8"
+    suffix = "arts"
+    ext = "tsv"
+  } else if (withArts) {
+    body = buildDeckArtList(deck)
+    suffix = "arts"
+  } else {
+    body = buildDeckList(deck)
   }
-  return new Response(lines.join("\n"), {
+  return new Response(body, {
     headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${deck.name.replace(/[^a-zA-Z0-9_-]+/g, "-")}.txt"`,
+      "Content-Type": contentType,
+      "Content-Disposition": `attachment; filename="${deckExportFilename(deck, suffix, ext)}"`,
     },
   })
 })

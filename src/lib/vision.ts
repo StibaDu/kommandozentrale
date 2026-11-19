@@ -1,5 +1,5 @@
-import { effectProfile, searchStructured } from "./cardsearch"
-import { roleFor, type Candidate, type VisionMatch } from "./engine"
+import { effectProfile, searchStructured, semanticSearchMany } from "./cardsearch"
+import { roleFor, tagsFor, type Candidate, type VisionMatch } from "./engine"
 import type { Card, DeckSettings } from "./types"
 
 /**
@@ -141,10 +141,123 @@ export function mergeVision(pool: Candidate[], vision: Candidate[]): Candidate[]
     const existing = byId.get(hit.card.oracle_id)
     if (existing) {
       existing.vision = hit.vision
+      if (hit.theme) existing.theme = hit.theme
       continue
     }
     merged.push(hit)
     byId.set(hit.card.oracle_id, hit)
   }
   return merged
+}
+
+/**
+ * Semantischer Retriever für die Deck-Vision und den Commander-Plan.
+ *
+ * Die lexikalische Effekt-Suche (oben) versteht nur Begriffe aus dem Glossar
+ * und Scryfall-Tags. Der Vektorindex findet zusätzlich Karten, deren Text
+ * dieselbe Mechanik umschreibt, ohne das Stichwort zu nennen — und er läuft
+ * auch dann, wenn die Vision nur vage bleibt. Der Commander-Text ist immer
+ * eine eigene Query, damit auch ohne Vision synergistische Karten im Pool
+ * landen.
+ */
+export async function visionVectorCandidates(
+  brief: string,
+  commander: Card,
+  settings: DeckSettings,
+  { perSpec = 10, maxTotal = 40, includeCommander = true }: { perSpec?: number; maxTotal?: number; includeCommander?: boolean } = {},
+): Promise<VisionCandidate[]> {
+  const specs = visionSpecs(brief)
+  const commanderBaseName = commander.name.split(",")[0].trim().toLowerCase()
+  const queries: Array<{ label: string; text: string }> = []
+  for (const spec of specs) queries.push({ label: spec.label, text: spec.label })
+  if (!specs.length && String(brief ?? "").trim().length >= 8) {
+    const label = clampLabel(brief)
+    queries.push({ label, text: String(brief).trim().slice(0, 2000) })
+  }
+  if (includeCommander) {
+    // Den Namen aus dem Oracle-Text entfernen: Sonst zieht die Suche Karten
+    // mit demselben Namen (z. B. andere Korvold-Varianten) statt Karten mit
+    // derselben Mechanik. Tags beschreiben die Strategie zusätzlich.
+    const commanderTags = tagsFor([commander.oracle_id]).get(commander.oracle_id) ?? []
+    const oracle = (commander.oracle_text_all ?? "").split(commander.name).join("this creature")
+    const commanderText = [
+      commander.type_line,
+      oracle,
+      commander.keywords.length ? commander.keywords.join(", ") : "",
+      commanderTags.length ? `Tags: ${commanderTags.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join(". ")
+      .slice(0, 4000)
+    if (commanderText) queries.push({ label: `Commander-Strategie: ${commander.name}`, text: commanderText })
+  }
+  if (!queries.length) return []
+
+  let resultSets
+  try {
+    resultSets = await semanticSearchMany(
+      queries.map((query) => query.text),
+      {
+        colorIdentity: commander.color_identity,
+        commanderLegal: !settings.allowIllegal,
+        excludeBasicLands: true,
+      },
+      perSpec,
+    )
+  } catch {
+    // Kein Index, Ollama aus: Die lexikalische Suche bleibt die Grundlage.
+    return []
+  }
+
+  const found = new Map<string, VisionCandidate>()
+  for (let index = 0; index < queries.length; index++) {
+    for (const hit of resultSets[index] ?? []) {
+      if (hit.card.oracle_id === commander.oracle_id || hit.card.is_one_win) continue
+      const cardBaseName = hit.card.name.split(",")[0].trim().toLowerCase()
+      if (commanderBaseName.length >= 5 && cardBaseName.includes(commanderBaseName)) continue
+      if (!settings.allowBanned && hit.card.legalities.commander === "banned") continue
+      if (!settings.allowIllegal && hit.card.legalities.commander !== "legal") continue
+
+      const existing = found.get(hit.card.oracle_id)
+      if (existing) {
+        for (const tag of hit.match.tags) {
+          if (!existing.vision.tags.includes(tag)) existing.vision.tags.push(tag)
+        }
+        continue
+      }
+
+      const tags = [...new Set(hit.match.tags)]
+      found.set(hit.card.oracle_id, {
+        card: hit.card,
+        role: roleFor(hit.card, tags),
+        tags,
+        vision: {
+          label: queries[index].label,
+          tags: [...tags],
+          snippet: hit.match.snippet,
+        },
+      })
+      if (found.size >= maxTotal) return [...found.values()]
+    }
+  }
+  return [...found.values()]
+}
+
+/** Führt lexikalische und semantische Vision-Treffer zusammen. Der erste
+ *  Treffer (lexikalisch) behält sein erklärbares Label. */
+export function combineVision(...lists: VisionCandidate[][]): VisionCandidate[] {
+  const out = new Map<string, VisionCandidate>()
+  for (const list of lists) {
+    for (const candidate of list) {
+      const existing = out.get(candidate.card.oracle_id)
+      if (existing) {
+        for (const tag of candidate.vision.tags) {
+          if (!existing.vision.tags.includes(tag)) existing.vision.tags.push(tag)
+        }
+        continue
+      }
+      out.set(candidate.card.oracle_id, candidate)
+    }
+  }
+  return [...out.values()]
 }

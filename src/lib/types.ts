@@ -142,6 +142,9 @@ export interface DeckCard {
   printing_id: string | null
   art_url: string | null
   artist: string | null
+  back_printing_id: string | null
+  back_art_url: string | null
+  back_artist: string | null
   quantity: number
   is_commander: boolean
   tags: string[]

@@ -8,11 +8,16 @@
     "start": "bun run build:client && bun src/server.ts",
     "build:client": "bun scripts/build-client.ts",
     "ingest": "bun src/ingest.ts",
+    "ingest:mpcfill": "bun scripts/ingest-mpcfill-nsfw.ts",
+    "ingest:mpcfill:status": "bun scripts/ingest-mpcfill-nsfw.ts --status",
+    "embed": "bun scripts/embed.ts",
+    "embed:status": "bun scripts/embed.ts --status",
+    "export:deck": "bun scripts/export-deck.ts",
     "seed:demo": "bun scripts/seed-demo.ts",
     "smoke": "bun scripts/smoke.ts",
     "eval": "bun scripts/eval.ts",
-    "start:lan": "HOST=0.0.0.0 bun run start",
-    "dev:lan": "HOST=0.0.0.0 bun run dev"
+    "start:lan": "bun run start",
+    "dev:lan": "bun run dev"
   },
   "dependencies": {
     "hono": "^4.6.0",

@@ -67,6 +67,40 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_card_tag_tag ON card_tag(tag);
 
+  CREATE TABLE IF NOT EXISTS card_embedding (
+    oracle_id TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    text_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_card_embedding_model ON card_embedding(model);
+
+  CREATE TABLE IF NOT EXISTS mpcfill_art (
+    identifier TEXT PRIMARY KEY,
+    card_name TEXT NOT NULL,
+    oracle_id TEXT,
+    face TEXT NOT NULL DEFAULT 'front',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    language TEXT,
+    dpi REAL,
+    source_name TEXT,
+    nsfw INTEGER NOT NULL DEFAULT 0,
+    image_url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_mpcfill_art_oracle ON mpcfill_art(oracle_id, face);
+  CREATE INDEX IF NOT EXISTS idx_mpcfill_art_name ON mpcfill_art(card_name COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS idx_mpcfill_art_nsfw ON mpcfill_art(nsfw);
+
+  CREATE TABLE IF NOT EXISTS mpcfill_query (
+    name TEXT PRIMARY KEY,
+    checked_at TEXT NOT NULL,
+    nsfw_count INTEGER NOT NULL DEFAULT 0
+  );
+
   CREATE TABLE IF NOT EXISTS card_query_cache (
     key TEXT PRIMARY KEY,
     result_json TEXT NOT NULL,
@@ -196,6 +230,44 @@ db.exec(`
     FOREIGN KEY (deck_id) REFERENCES deck(id) ON DELETE CASCADE
   );
   CREATE INDEX IF NOT EXISTS idx_deck_revision_deck ON deck_revision(deck_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS deck_simulation (
+    id TEXT PRIMARY KEY,
+    deck_id TEXT NOT NULL,
+    deck_updated_at TEXT,
+    report_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (deck_id) REFERENCES deck(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_deck_simulation_deck ON deck_simulation(deck_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS deck_chat_message (
+    id TEXT PRIMARY KEY,
+    deck_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    model TEXT,
+    session_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (deck_id) REFERENCES deck(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_deck_chat_message_deck ON deck_chat_message(deck_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS deck_chat_proposal (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    deck_id TEXT NOT NULL,
+    cut_name TEXT NOT NULL,
+    add_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    fixes_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    applied_at TEXT,
+    FOREIGN KEY (message_id) REFERENCES deck_chat_message(id) ON DELETE CASCADE,
+    FOREIGN KEY (deck_id) REFERENCES deck(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_deck_chat_proposal_deck ON deck_chat_proposal(deck_id, status, created_at);
 
   CREATE TABLE IF NOT EXISTS build_run (
     id TEXT PRIMARY KEY,
@@ -389,7 +461,13 @@ addColumn("deck", "brief", "TEXT NOT NULL DEFAULT ''")
 addColumn("deck", "commander_printing_id", "TEXT")
 addColumn("deck", "commander_art_url", "TEXT")
 addColumn("deck", "commander_artist", "TEXT")
+addColumn("deck", "commander_back_printing_id", "TEXT")
+addColumn("deck", "commander_back_art_url", "TEXT")
+addColumn("deck", "commander_back_artist", "TEXT")
 addColumn("deck_card", "board", "TEXT NOT NULL DEFAULT 'main'")
+addColumn("deck_card", "back_printing_id", "TEXT")
+addColumn("deck_card", "back_art_url", "TEXT")
+addColumn("deck_card", "back_artist", "TEXT")
 db.exec("CREATE INDEX IF NOT EXISTS idx_deck_card_board ON deck_card(deck_id, board)")
 const hadDeckSavedAt = hasColumn("deck", "saved_at")
 addColumn("deck", "saved_at", "TEXT")

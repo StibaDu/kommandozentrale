@@ -4,7 +4,11 @@ import { BracketDial, Icon, ManaCost, Markdown, Modal, NumberField, PodPicker, S
 import { applyZeroRule } from "./settings"
 import { ImportModal } from "./ImportModal"
 import { DeckCombos, wouldBreakCombo } from "./DeckCombos"
+import { DeckChat } from "./DeckChat"
+import { CardPreview } from "./CardPreview"
 import { DeckDoctor } from "./DeckDoctor"
+import { DeckIdeaPreview } from "./DeckIdeaPreview"
+import { DeckSimulation } from "./DeckSimulation"
 import { DeckHistory } from "./DeckHistory"
 import { DeckLab } from "./DeckLab"
 import { MobileConnectModal } from "./MobileConnect"
@@ -61,6 +65,9 @@ function commanderAsDeckCard(deck: Deck): DeckCard {
     printing_id: commander.printing_id,
     art_url: commander.art_url,
     artist: commander.artist,
+    back_printing_id: commander.back_printing_id,
+    back_art_url: commander.back_art_url,
+    back_artist: commander.back_artist,
     quantity: 1,
     is_commander: true,
     tags: [],
@@ -123,7 +130,7 @@ export default function App() {
   const [saveOwner, setSaveOwner] = useState("")
   const [savingDeck, setSavingDeck] = useState(false)
   const [cardModal, setCardModal] = useState<DeckCard | null>(null)
-  const [artModal, setArtModal] = useState<DeckCard | null>(null)
+  const [artModal, setArtModal] = useState<{ card: DeckCard; face: "front" | "back" } | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const pollRef = useRef<number | null>(null)
@@ -605,26 +612,44 @@ export default function App() {
     }
   }
 
-  async function chooseArt(card: DeckCard, option: ArtOption | { artUrl: string; artist?: string; printingId?: string }) {
+  async function chooseArt(
+    entry: { card: DeckCard; face: "front" | "back" },
+    option: ArtOption | { artUrl: string; artist?: string; printingId?: string },
+  ) {
     if (!deck) return
-    const body =
-      "source" in option
-        ? { printingId: option.id.startsWith("mpcfill:") ? option.id : option.id, artUrl: option.imageUrl, artist: option.artist ?? null }
-        : { printingId: option.printingId ?? null, artUrl: option.artUrl, artist: option.artist ?? null }
+    const { card, face } = entry
+    let body: Parameters<typeof api.setArt>[2]
+    if ("source" in option) {
+      const backImage = option.backImageUrl ?? null
+      const imageUrl = face === "back" ? (backImage ?? option.imageUrl) : option.imageUrl
+      const artist = face === "back" ? (option.backArtist ?? option.artist ?? null) : (option.artist ?? null)
+      body = {
+        face,
+        printingId: option.id,
+        artUrl: imageUrl,
+        artist,
+        ...(face === "front" && backImage
+          ? { backPrintingId: option.id, backArtUrl: backImage, backArtist: option.backArtist ?? null }
+          : {}),
+      }
+    } else {
+      body = { face, printingId: option.printingId ?? null, artUrl: option.artUrl, artist: option.artist ?? null }
+    }
     await api.setArt(deck.id, card.oracle_id, body)
     const d = await api.deck(deck.id)
     setDeck(d)
     setArtModal(null)
-    setNotice(`Art für ${card.name} gespeichert.`)
+    setNotice(face === "back" ? `Rückseiten-Art für ${card.name} gespeichert.` : `Art für ${card.name} gespeichert.`)
   }
 
-  async function clearArt(card: DeckCard) {
+  async function clearArt(entry: { card: DeckCard; face: "front" | "back" }) {
     if (!deck) return
-    await api.setArt(deck.id, card.oracle_id, { printingId: null, artUrl: null, artist: null })
+    const { card, face } = entry
+    await api.setArt(deck.id, card.oracle_id, { face, printingId: null, artUrl: null, artist: null })
     const d = await api.deck(deck.id)
     setDeck(d)
     setArtModal(null)
-    setNotice(`Art für ${card.name} zurückgesetzt.`)
+    setNotice(face === "back" ? `Rückseiten-Art für ${card.name} zurückgesetzt.` : `Art für ${card.name} zurückgesetzt.`)
   }
 
   async function startNewDeck() {
@@ -904,12 +929,17 @@ export default function App() {
               onBuild={() => requestBuild(deck.id)}
               onCancel={cancelBuild}
               onCard={setCardModal}
-              onArt={setArtModal}
+              onArt={(card) => setArtModal({ card, face: "front" })}
               onAdd={addCard}
               onRemove={removeCard}
               onMove={moveCard}
               onSwap={swapCard}
-              onExport={() => window.open(`/api/decks/${deck.id}/export`, "_blank")}
+              onExport={(mode = "plain") =>
+                window.open(
+                  `/api/decks/${deck.id}/export${mode === "arts" ? "?arts=1" : mode === "tsv" ? "?format=tsv" : ""}`,
+                  "_blank",
+                )
+              }
               onSettingsPage={() => setView("settings")}
               onNew={startNewDeck}
               onDoctorApplied={(next) => {
@@ -1023,8 +1053,8 @@ export default function App() {
           card={cardModal}
           deckId={deck?.id ?? ""}
           onClose={() => setCardModal(null)}
-          onArt={() => {
-            setArtModal(cardModal)
+          onArt={(face) => {
+            setArtModal({ card: cardModal, face })
             setCardModal(null)
           }}
           onRemove={cardModal.is_commander ? undefined : () => removeCard(cardModal)}
@@ -1038,7 +1068,8 @@ export default function App() {
 
       {artModal && deck && (
         <ArtModal
-          card={artModal}
+          card={artModal.card}
+          face={artModal.face}
           onClose={() => setArtModal(null)}
           onChoose={(option) => chooseArt(artModal, option)}
           onClear={() => clearArt(artModal)}
@@ -1109,6 +1140,8 @@ function StartScreen({
   const [suggesting, setSuggesting] = useState(false)
   const [suggestError, setSuggestError] = useState<string | null>(null)
   const [suggestNote, setSuggestNote] = useState<string | null>(null)
+  const [ideaPreview, setIdeaPreview] = useState<CommanderSuggestion | null>(null)
+  const [cardPreviewName, setCardPreviewName] = useState<string | null>(null)
   const suggestToken = useRef(0)
   const visionReady = brief.trim().length >= 8
 
@@ -1118,6 +1151,8 @@ function StartScreen({
     setSuggestions([])
     setSuggestError(null)
     setSuggestNote(null)
+    setIdeaPreview(null)
+    setCardPreviewName(null)
   }, [brief, bracket, pod, settings])
 
   async function suggestCommanders() {
@@ -1149,7 +1184,7 @@ function StartScreen({
     <div className="start-grid">
       <section className="start-main">
         <h2 className="display">Beschreib dein Deck.</h2>
-        <p className="lede">Schreib deine Vision. Die KI sucht den passenden Commander und baut daraus das Deck. Die Engine prüft Manabase, Rollen und Bracket.</p>
+        <p className="lede">Schreib deine Vision. Die KI schlägt ganze Deck-Ideen mit Strategie, Schlüsselkarten, Synergien, Wincons und einer vollständigen Kartenvorschau vor; die Engine prüft Manabase, Rollen und Bracket.</p>
 
         <div className="vision-block start-vision">
           <label htmlFor="start-brief" className="field-label">Deck-Vision</label>
@@ -1191,25 +1226,25 @@ function StartScreen({
 
         <div className="suggest-block">
           <div className="suggest-head">
-            <div className="suggest-intro">
-              <h3>Commander aus deiner Vision.</h3>
-              <p>Die KI schlägt bis zu drei Commander vor, die zu Mechanik, Tempo, Bracket und Hausregeln passen. Du entscheidest.</p>
+              <div className="suggest-intro">
+                <h3>Deck-Ideen aus deiner Vision.</h3>
+                <p>Die KI schlägt bis zu drei vollständige Deck-Ideen vor: Strategie, Schlüsselkarten, Synergien, Wincons und eine 99-Karten-Vorschau. Du entscheidest.</p>
+              </div>
+              <button
+                type="button"
+                className="button primary suggest-action"
+                onClick={() => void suggestCommanders()}
+                disabled={!visionReady || suggesting}
+              >
+                <Icon name="spark" size={16} /> {suggesting ? "KI prüft ..." : "Deck-Ideen vorschlagen"}
+              </button>
             </div>
-            <button
-              type="button"
-              className="button primary suggest-action"
-              onClick={() => void suggestCommanders()}
-              disabled={!visionReady || suggesting}
-            >
-              <Icon name="spark" size={16} /> {suggesting ? "KI prüft ..." : "Commander vorschlagen"}
-            </button>
-          </div>
-          {!visionReady && <p className="field-note">Ein paar Sätze Vision reichen, dann sucht die KI passende Commander.</p>}
-          {suggesting && (
-            <div className="suggest-progress" role="status">
-              <span className="build-line" />
-              <div className="suggest-progress-copy">
-                <p>Die KI prüft deine Vision und sucht passende Commander. Das kann einen Moment dauern.</p>
+            {!visionReady && <p className="field-note">Ein paar Sätze Vision reichen, dann sucht die KI passende Deck-Ideen.</p>}
+            {suggesting && (
+              <div className="suggest-progress" role="status">
+                <span className="build-line" />
+                <div className="suggest-progress-copy">
+                  <p>Die KI prüft deine Vision und baut Deck-Ideen mit Schlüsselkarten, Synergien und vollständiger Vorschau. Das kann einen Moment dauern.</p>
                 <button type="button" className="text-link" onClick={cancelSuggest}>
                   Abbrechen
                 </button>
@@ -1226,27 +1261,104 @@ function StartScreen({
             <div className="suggest-results">
               <div className="suggest-results-head">
                 <h4>Vorschläge</h4>
-                <span className="panel-count">{suggestions.length} Commander</span>
+                <span className="panel-count">{suggestions.length} Ideen</span>
               </div>
               <div className="suggest-list">
                 {suggestions.map((suggestion) => {
                   const img = suggestion.image_uris?.art_crop ?? suggestion.image_uris?.normal
                   return (
                     <article className="suggest-card" key={suggestion.oracle_id}>
-                      <div className="suggest-art" style={img ? { backgroundImage: `url(${artSrc(img)})` } : undefined} aria-hidden="true" />
+                      <button
+                        type="button"
+                        className="suggest-art suggest-art-button"
+                        style={img ? { backgroundImage: `url(${artSrc(img)})` } : undefined}
+                        onClick={() => setCardPreviewName(suggestion.name)}
+                        aria-label={`${suggestion.name} ansehen`}
+                        title={`${suggestion.name} ansehen`}
+                      />
                       <div className="suggest-copy">
                         <div className="suggest-meta">
                           <span>{suggestion.color_identity.join("") || "farblos"}</span>
                           <span>{suggestion.edhrec_rank ? `EDHREC #${suggestion.edhrec_rank}` : "EDHREC —"}</span>
                         </div>
-                        <h4>{suggestion.name}</h4>
+                        <h4>
+                          <button
+                            type="button"
+                            className="suggest-name-button"
+                            onClick={() => setCardPreviewName(suggestion.name)}
+                            title={`${suggestion.name} ansehen`}
+                          >
+                            {suggestion.name}
+                          </button>
+                        </h4>
                         <div className="suggest-mana">
                           <ManaCost cost={suggestion.mana_cost} />
                         </div>
-                        <p>{suggestion.reason}</p>
+                        <p>{suggestion.idea?.strategy ?? suggestion.reason}</p>
+                        {suggestion.idea && (
+                          <div className="suggest-idea">
+                            {suggestion.idea.themes.length > 0 && (
+                              <div className="tag-row">
+                                {suggestion.idea.themes.map((theme) => (
+                                  <span key={theme} className="tag">{theme}</span>
+                                ))}
+                              </div>
+                            )}
+                            <div className="suggest-idea-grid">
+                              <div>
+                                <span className="field-label">Schlüsselkarten</span>
+                                <div className="tag-row">
+                                  {suggestion.idea.keyCards.slice(0, 10).map((card) => (
+                                    <button
+                                      key={card.name}
+                                      type="button"
+                                      className="tag tag-button"
+                                      title={`${card.role} · ${card.why}`}
+                                      onClick={() => setCardPreviewName(card.name)}
+                                    >
+                                      {card.name}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                              {suggestion.idea.synergies.length > 0 && (
+                                <div>
+                                  <span className="field-label">Synergien</span>
+                                  <ul className="suggest-idea-list">
+                                    {suggestion.idea.synergies.map((line) => (
+                                      <li key={line}>{line}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {suggestion.idea.wincons.length > 0 && (
+                                <div>
+                                  <span className="field-label">Wincons</span>
+                                  <div className="tag-row">
+                                    {suggestion.idea.wincons.map((wincon) => (
+                                      <button
+                                        key={wincon}
+                                        type="button"
+                                        className="tag tag-button"
+                                        onClick={() => setCardPreviewName(wincon)}
+                                        title={`${wincon} ansehen`}
+                                      >
+                                        {wincon}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                            <p className="field-note">{suggestion.idea.risks}</p>
+                          </div>
+                        )}
                         <div className="suggest-actions">
                           <button type="button" className="button primary" onClick={() => onBuildSuggestion(suggestion.name)}>
-                            Diesen Vorschlag bauen
+                            Diese Deck-Idee bauen
+                          </button>
+                          <button type="button" className="button ghost" onClick={() => setIdeaPreview(suggestion)}>
+                            <Icon name="grid" size={15} /> Ganzes Deck ansehen
                           </button>
                           <button type="button" className="text-link" onClick={() => onPick(suggestion.name)}>
                             Nur Commander übernehmen
@@ -1289,10 +1401,28 @@ function StartScreen({
         )}
       </section>
 
+      {ideaPreview && (
+        <DeckIdeaPreview
+          suggestion={ideaPreview}
+          brief={brief}
+          bracket={bracket}
+          pod={pod}
+          settings={settings}
+          onClose={() => setIdeaPreview(null)}
+          onBuild={() => {
+            const name = ideaPreview.name
+            setIdeaPreview(null)
+            onBuildSuggestion(name)
+          }}
+        />
+      )}
+
+      {cardPreviewName && <CardPreview name={cardPreviewName} onClose={() => setCardPreviewName(null)} />}
+
       <aside className="start-aside">
         <div className="aside-block">
           <h3>Brief statt Prompt</h3>
-          <p>Deck-Vision, Bracket, Pod-Größe und Hausregeln. Die KI sucht den Commander, der zu deinem Auftrag passt.</p>
+          <p>Deck-Vision, Bracket, Pod-Größe und Hausregeln. Die KI schlägt vollständige Deck-Ideen mit Strategie, Schlüsselkarten, Synergien, Wincons und 99-Karten-Vorschau vor.</p>
         </div>
         <div className="aside-block">
           <h3>Engine statt Bauchgefühl</h3>
@@ -1462,7 +1592,7 @@ function BuilderScreen({
   onRemove: (card: DeckCard) => Promise<boolean> | void
   onMove: (card: DeckCard, board: "main" | "maybeboard") => Promise<boolean> | void
   onSwap: (addName: string, removeOracleId: string) => Promise<boolean>
-  onExport: () => void
+  onExport: (mode?: "plain" | "arts" | "tsv") => void
   onSettingsPage: () => void
   onNew: () => void
   onDoctorApplied: (deck: Deck) => void
@@ -1575,8 +1705,11 @@ function BuilderScreen({
           )}
           {!busy && buildRun?.status === "error" && <p className="field-note is-error">{buildRun.error}</p>}
           {!busy && buildRun?.status === "cancelled" && <p className="field-note">Build abgebrochen.</p>}
-          <button type="button" className="button ghost wide" onClick={onExport}>
+          <button type="button" className="button ghost wide" onClick={() => onExport("plain")}>
             <Icon name="download" size={16} /> Deckliste exportieren
+          </button>
+          <button type="button" className="button ghost wide" onClick={() => onExport("arts")}>
+            <Icon name="download" size={16} /> Deckliste + Arts exportieren
           </button>
         </section>
       </aside>
@@ -1780,11 +1913,11 @@ function DeckPanel({
   onRemove: (card: DeckCard) => Promise<boolean> | void
   onMove: (card: DeckCard, board: "main" | "maybeboard") => Promise<boolean> | void
   onSwap: (addName: string, removeOracleId: string) => Promise<boolean>
-  onExport: () => void
+  onExport: (mode?: "plain" | "arts" | "tsv") => void
   onDoctorApplied: (deck: Deck) => void
   onNotice: (text: string) => void
 }) {
-  const [tab, setTab] = useState<"deck" | "primer" | "combos" | "doctor" | "labor" | "history">("deck")
+  const [tab, setTab] = useState<"deck" | "primer" | "combos" | "chat" | "simulation" | "doctor" | "labor" | "history">("deck")
   const [adding, setAdding] = useState(false)
   const [view, setView] = useState<DeckView>(initialDeckView)
   const [diffBanner, setDiffBanner] = useState(true)
@@ -1886,8 +2019,24 @@ function DeckPanel({
                   <Icon name="plus" size={16} /> Karte
                 </button>
               )}
-              <button type="button" className="button ghost" onClick={onExport}>
+              <button type="button" className="button ghost" onClick={() => onExport("plain")}>
                 <Icon name="download" size={16} /> Export
+              </button>
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => onExport("arts")}
+                title="Deckliste mit MPCFill- und Custom-Art-Quellen, Artist und URL"
+              >
+                <Icon name="download" size={16} /> Export + Arts
+              </button>
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => onExport("tsv")}
+                title="Maschinenlesbare Liste mit Menge, Name, Art-Quelle, Art-ID und URL"
+              >
+                <Icon name="download" size={16} /> TSV
               </button>
               {tab === "deck" && (
                 <div className="view-switch" role="group" aria-label="Deckansicht">
@@ -1945,6 +2094,12 @@ function DeckPanel({
         </button>
         <button type="button" role="tab" aria-selected={tab === "combos"} className={cx("tab", tab === "combos" && "is-active")} onClick={() => setTab("combos")}>
           Combos
+        </button>
+        <button type="button" role="tab" aria-selected={tab === "chat"} className={cx("tab", tab === "chat" && "is-active")} onClick={() => setTab("chat")}>
+          Chat
+        </button>
+        <button type="button" role="tab" aria-selected={tab === "simulation"} className={cx("tab", tab === "simulation" && "is-active")} onClick={() => setTab("simulation")}>
+          Simulation
         </button>
         <button type="button" role="tab" aria-selected={tab === "doctor"} className={cx("tab", tab === "doctor" && "is-active")} onClick={() => setTab("doctor")}>
           Doctor
@@ -2204,6 +2359,10 @@ function DeckPanel({
         </div>
       ) : tab === "combos" ? (
         <DeckCombos deck={deck} onNotice={onNotice} onAdd={onAdd} onSwap={onSwap} />
+      ) : tab === "chat" ? (
+        <DeckChat deck={deck} canEdit={editable} onDeck={onDoctorApplied} onNotice={onNotice} />
+      ) : tab === "simulation" ? (
+        <DeckSimulation deck={deck} canEdit={editable} onDeck={onDoctorApplied} onNotice={onNotice} />
       ) : tab === "doctor" ? (
         <DeckDoctor deck={deck} canEdit={editable} onDeck={onDoctorApplied} onNotice={onNotice} />
       ) : tab === "labor" ? (
@@ -2345,7 +2504,7 @@ function CardModal({
   card: DeckCard
   deckId: string
   onClose: () => void
-  onArt: () => void
+  onArt: (face: "front" | "back") => void
   onRemove?: () => void
   onMove?: () => void
 }) {
@@ -2353,6 +2512,7 @@ function CardModal({
   const [german, setGerman] = useState<GermanCardText | null>(null)
   const [germanLoading, setGermanLoading] = useState(true)
   const [germanError, setGermanError] = useState<string | null>(null)
+  const [flipped, setFlipped] = useState(false)
   useEffect(() => {
     let alive = true
     api
@@ -2389,18 +2549,50 @@ function CardModal({
     }
   }, [card.oracle_id])
 
-  const img = artSrc(card.art_url) || card.image_uris?.normal || card.image_uris?.border_crop
+  const faces = card.card_faces ?? []
+  const isDfc = faces.length >= 2
+  const frontImg =
+    artSrc(card.art_url) || card.image_uris?.normal || card.image_uris?.border_crop || faces[0]?.image_uris?.normal
+  const backImg =
+    artSrc(card.back_art_url) ||
+    faces[1]?.image_uris?.normal ||
+    faces[1]?.image_uris?.large ||
+    faces[1]?.image_uris?.png
+  const face: "front" | "back" = flipped && isDfc ? "back" : "front"
+  const img = face === "back" ? backImg : frontImg
+  const toggleFace = () => {
+    if (isDfc) setFlipped((value) => !value)
+  }
   return (
-    <Modal title={card.name} onClose={onClose} wide>
+    <Modal title={german?.name ?? card.name} onClose={onClose} wide>
       <div className="card-detail">
-        <div className="card-detail-art">{img && <img src={img} alt={card.name} />}</div>
+        <div
+          className={cx("card-detail-art", isDfc && "is-flippable")}
+          onClick={toggleFace}
+          role={isDfc ? "button" : undefined}
+          tabIndex={isDfc ? 0 : undefined}
+          aria-label={isDfc ? (face === "back" ? "Vorderseite anzeigen" : "Rückseite anzeigen") : undefined}
+          onKeyDown={(event) => {
+            if (isDfc && (event.key === "Enter" || event.key === " ")) {
+              event.preventDefault()
+              toggleFace()
+            }
+          }}
+        >
+          {img && <img src={img} alt={face === "back" ? `${card.name} (Rückseite)` : card.name} />}
+          {isDfc && (
+            <span className="card-flip-hint">
+              {face === "back" ? "Rückseite" : "Vorderseite"} · klicken zum Drehen
+            </span>
+          )}
+        </div>
         <div className="card-detail-copy">
           <div className="card-detail-meta">
-            <ManaCost cost={card.mana_cost} />
-            <span>{card.type_line}</span>
-            <span className="chip">{ROLE_LABEL[card.role] ?? card.role}</span>
+              <ManaCost cost={card.mana_cost} />
+              <span>{german?.type_line ?? card.type_line}</span>
+              <span className="chip">{ROLE_LABEL[card.role] ?? card.role}</span>
           </div>
-          {german?.name && german.name !== card.name && <p className="card-german-name">Deutsch: {german.name}</p>}
+          {german?.name && german.name !== card.name && <p className="card-german-name">Englisch: {card.name}</p>}
           <div className="oracle-block">
             {german?.card_faces?.length ? (
               german.card_faces.map((face) => (
@@ -2441,8 +2633,13 @@ function CardModal({
             </details>
           ) : null}
           <div className="modal-actions">
-            <button type="button" className="button primary" onClick={onArt}>
-              <Icon name="image" size={16} /> Art ändern
+            {isDfc && (
+              <button type="button" className="button ghost" onClick={toggleFace}>
+                <Icon name="refresh" size={16} /> {face === "back" ? "Vorderseite" : "Rückseite"}
+              </button>
+            )}
+            <button type="button" className="button primary" onClick={() => onArt(face)}>
+              <Icon name="image" size={16} /> Art {face === "back" ? "der Rückseite" : ""} ändern
             </button>
             {onMove && (
               <button type="button" className="button ghost" onClick={onMove}>
@@ -2463,16 +2660,18 @@ function CardModal({
 
 function ArtModal({
   card,
+  face,
   onClose,
   onChoose,
   onClear,
 }: {
   card: DeckCard
+  face: "front" | "back"
   onClose: () => void
   onChoose: (option: ArtOption | { artUrl: string; artist?: string; printingId?: string }) => void
   onClear: () => void
 }) {
-  const [tab, setTab] = useState<"scryfall" | "mpcfill" | "url">("scryfall")
+  const [tab, setTab] = useState<"scryfall" | "mpcfill" | "nsfw" | "url">("scryfall")
   const [printings, setPrintings] = useState<ArtOption[]>([])
   const [mpc, setMpc] = useState<ArtOption[]>([])
   const [loading, setLoading] = useState(false)
@@ -2483,7 +2682,7 @@ function ArtModal({
     let alive = true
     setLoading(true)
     setError(null)
-    Promise.allSettled([api.printings(card.oracle_id), api.mpcfill(card.oracle_id)]).then(([p, m]) => {
+    Promise.allSettled([api.printings(card.oracle_id), api.mpcfill(card.oracle_id, face)]).then(([p, m]) => {
       if (!alive) return
       if (p.status === "fulfilled") setPrintings(p.value.printings)
       if (m.status === "fulfilled") {
@@ -2495,12 +2694,23 @@ function ArtModal({
     return () => {
       alive = false
     }
-  }, [card.oracle_id])
+  }, [card.oracle_id, face])
 
-  const options = tab === "scryfall" ? printings : tab === "mpcfill" ? mpc : []
+  const hasNsfw = (option: ArtOption) => (option.tags ?? []).some((tag) => /nsfw/i.test(String(tag)))
+  const mpcSfw = mpc.filter((option) => !hasNsfw(option))
+  const mpcNsfw = mpc.filter(hasNsfw)
+  const options = tab === "scryfall" ? printings : tab === "mpcfill" ? mpcSfw : tab === "nsfw" ? mpcNsfw : []
+  const visibleOptions =
+    face === "back"
+      ? options.filter((option) => option.source !== "scryfall" || Boolean(option.backImageUrl))
+      : options
+  const optionImage = (option: ArtOption) =>
+    face === "back" ? (option.backImageUrl ?? option.imageUrl) : option.imageUrl
+  const optionThumb = (option: ArtOption) =>
+    face === "back" ? (option.backThumbnailUrl ?? option.thumbnailUrl) : option.thumbnailUrl
 
   return (
-    <Modal title={`Art für ${card.name}`} onClose={onClose} wide>
+    <Modal title={`Art für ${card.name}${face === "back" ? " · Rückseite" : ""}`} onClose={onClose} wide>
       <div className="art-tabs" role="tablist">
         <button type="button" role="tab" aria-selected={tab === "scryfall"} className={cx("tab", tab === "scryfall" && "is-active")} onClick={() => setTab("scryfall")}>
           Scryfall
@@ -2508,15 +2718,22 @@ function ArtModal({
         <button type="button" role="tab" aria-selected={tab === "mpcfill"} className={cx("tab", tab === "mpcfill" && "is-active")} onClick={() => setTab("mpcfill")}>
           MPCFill Community
         </button>
+        <button type="button" role="tab" aria-selected={tab === "nsfw"} className={cx("tab", tab === "nsfw" && "is-active")} onClick={() => setTab("nsfw")}>
+          NSFW{mpcNsfw.length ? ` (${mpcNsfw.length})` : ""}
+        </button>
         <button type="button" role="tab" aria-selected={tab === "url"} className={cx("tab", tab === "url" && "is-active")} onClick={() => setTab("url")}>
           Eigene URL
         </button>
       </div>
 
+      {face === "back" && tab === "scryfall" && (
+        <p className="field-note">Gezeigt werden die Rückseiten der Printings. Printings ohne Rückseite werden ausgeblendet.</p>
+      )}
+
       {tab === "url" ? (
         <div className="url-form">
           <label className="field-label" htmlFor="art-url">
-            Bild-URL
+            Bild-URL {face === "back" ? "für die Rückseite" : ""}
           </label>
           <input id="art-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://..." />
           <p className="field-note">Für private Proxies. Keine offiziellen Karten als Handelsware verwenden.</p>
@@ -2527,26 +2744,31 @@ function ArtModal({
       ) : (
         <>
           <div className="art-grid">
-            {options.map((option) => (
+            {visibleOptions.map((option) => (
               <button key={option.id} type="button" className="art-option" onClick={() => onChoose(option)} title={option.name}>
-                <img src={artSrc(option.thumbnailUrl || option.imageUrl)} alt="" loading="lazy" />
+                <img src={artSrc(optionThumb(option) || optionImage(option))} alt="" loading="lazy" />
                 <span className="art-meta">
                   <span>{option.setCode ?? "MPCFill"}</span>
-                  <span>{option.artist ?? option.note ?? ""}</span>
+                  <span>{(face === "back" ? option.backArtist : option.artist) ?? option.note ?? ""}</span>
                   {option.lang && <span>{option.lang}</span>}
+                  {option.tags?.some((tag) => /nsfw/i.test(tag)) && <span className="badge is-warn">NSFW</span>}
                 </span>
               </button>
             ))}
           </div>
           {loading && <p className="muted">Arts werden geladen. MPCFill kann einen Moment brauchen.</p>}
-          {!loading && options.length === 0 && <p className="muted">Keine Alternativen gefunden.</p>}
+          {!loading && visibleOptions.length === 0 && (
+            <p className="muted">
+              {tab === "nsfw" ? "Keine NSFW-Arts für diese Karte." : "Keine passenden Alternativen gefunden."}
+            </p>
+          )}
           {error && <p className="field-note is-error">{error}</p>}
         </>
       )}
 
       <div className="modal-actions">
         <button type="button" className="button ghost" onClick={onClear}>
-          Art zurücksetzen
+          {face === "back" ? "Rückseiten-Art zurücksetzen" : "Art zurücksetzen"}
         </button>
       </div>
     </Modal>

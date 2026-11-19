@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { api, type AuthUser, type BabyzillaInfo, type Invite, type Meta, type Profile } from "./api"
+import { api, type AuthUser, type BabyzillaInfo, type EmbeddingStatus, type Invite, type Meta, type Profile } from "./api"
 import { copyText } from "./clipboard"
 import { Icon } from "./ui"
 
@@ -46,6 +46,7 @@ export function ProfilePage({
   const [inviteError, setInviteError] = useState<string | null>(null)
   const [qrInvite, setQrInvite] = useState<string | null>(null)
   const [babyzilla, setBabyzilla] = useState<BabyzillaInfo | null>(null)
+  const [embeddings, setEmbeddings] = useState<EmbeddingStatus | null>(null)
 
   useEffect(() => {
     setDisplayName(user.display_name)
@@ -58,6 +59,19 @@ export function ProfilePage({
       .babyzilla()
       .then((value) => {
         if (alive) setBabyzilla(value)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let alive = true
+    api
+      .embeddings()
+      .then((value) => {
+        if (alive) setEmbeddings(value)
       })
       .catch(() => {})
     return () => {
@@ -212,7 +226,9 @@ export function ProfilePage({
               <p className="muted">
                 {meta.network.publicUrl
                   ? "Der mobile Begleiter läuft über diese feste öffentliche Adresse:"
-                  : "Der mobile Begleiter läuft unter dieser Adresse. Im WLAN ist die stabile .local-Adresse der beste Einstieg:"}
+                  : meta.network.mdnsUrl
+                    ? "Der mobile Begleiter läuft unter dieser Adresse. Im WLAN ist die stabile .local-Adresse der beste Einstieg:"
+                    : "Der mobile Begleiter läuft unter dieser Adresse. Beide Geräte müssen im gleichen WLAN sein:"}
               </p>
               <div className="lan-url">
                 <code>{`${meta.network.lanUrl}/m`}</code>
@@ -234,14 +250,14 @@ export function ProfilePage({
                 Mobilen Tisch öffnen
               </a>
               <p className="field-note">
-                Der Server ist standardmäßig im LAN erreichbar. Die macOS-Firewall muss eingehende Verbindungen für Bun erlauben.
+                Der Server ist standardmäßig im LAN erreichbar. {meta.network.mdnsUrl ? "Die macOS-Firewall" : "Die Firewall von Windows"} muss eingehende Verbindungen für Bun erlauben.
                 {meta.network.tailscaleAvailable
                   ? " Für unterwegs Tailscale starten; die App zeigt die Adresse dann im Handy-Dialog."
                   : " Für unterwegs kann eine feste PUBLIC_URL oder Tailscale genutzt werden."}
               </p>
             </>
           ) : (
-            <p className="muted">Keine LAN-Adresse gefunden. Prüfe die Netzwerkverbindung des Macs.</p>
+            <p className="muted">Keine LAN-Adresse gefunden. Prüfe die Netzwerkverbindung des Rechners.</p>
           )}
           <p className="field-note">Das Handy ist der Companion: Profile, Decks, Statistiken und der Live-Life-Counter. Einstellungen und Deckbau bleiben am Rechner.</p>
         </section>
@@ -281,6 +297,34 @@ export function ProfilePage({
             <p className="muted">Babyzilla ist nicht erreichbar. Die App läuft trotzdem; die KI-Aufrufe gehen weiter über OpenCode.</p>
           )}
           <p className="field-note">Kontextbudget der KI-Builds: 240 statt 360 Kandidaten. Das kürzt den Prompt, ohne die Rollenabdeckung zu verlieren.</p>
+        </section>
+
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Vektor-Index</h2>
+            <span className="panel-count">{embeddings?.ready ? "aktiv" : "leer"}</span>
+          </div>
+          {embeddings ? (
+            embeddings.ready ? (
+              <>
+                <p className="muted">
+                  Semantische Suche über {embeddings.count.toLocaleString("de-DE")} von{" "}
+                  {embeddings.total.toLocaleString("de-DE")} Karten ({embeddings.dim ?? "?"} Dimensionen, {embeddings.model}).
+                </p>
+                <p className="field-note">
+                  Die KI findet Karten damit auch über Text und Mechanik statt nur über Namen. Neu aufbauen:{" "}
+                  <code>bun run embed</code>.
+                </p>
+              </>
+            ) : (
+              <p className="muted">
+                Noch kein Vektorindex. Einmal <code>bun run embed</code> ausführen; danach sucht die App Karten auch über
+                Mechanik und Text.
+              </p>
+            )
+          ) : (
+            <p className="muted">Index-Status nicht verfügbar.</p>
+          )}
         </section>
 
         <section className="panel">
